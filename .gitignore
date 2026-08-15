@@ -1,0 +1,29 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 本地配置与数据（config.json 含 token，不入库）----
+config.json
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 证书密钥与防火墙规则标记（SECURITY.md §4.11.4，严禁入库）----
+*.pem
+*.key
+.firewall-rule
+
+# ---- 开发验证 scratch（wheel 解压目录 / 集成测试目录）----
+.piptmp/
+.devtest/
+
+# ---- 测试残留目录（模块自检/冒烟创建的临时目录）----
+vpsmon_storage_test_*/
+vpsmon_collector_test_*/
+vpsmon_api_test_*/
+vpsmon_x_*/
+
+# ---- Agent 协作状态目录（团队/邮箱数据，不入库）----
+.agent-teams/

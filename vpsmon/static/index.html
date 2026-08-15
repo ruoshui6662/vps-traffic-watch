@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VPS 流量监控</title>
+<meta name="description" content="VPS 流量统计监控仪表盘：月度入站/出站流量、CPU、内存、磁盘实时监控">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2322d3ee'/%3E%3Cstop offset='1' stop-color='%23a78bfa'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='6' fill='%230b1220'/%3E%3Cpath d='M7 14l5-5 5 5' stroke='url(%23g)' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="bg-decor" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="22" height="22"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs><path d="M7 14l5-5 5 5" stroke="url(#lg)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 20h16" stroke="url(#lg)" stroke-width="2" stroke-linecap="round"/></svg>
+    </div>
+    <div class="brand-text">
+      <h1>VPS 流量监控</h1>
+      <div class="sub" id="host-sub"><span class="dot"></span>主机 <span id="host-addr">连接中…</span> · 网卡 <span id="iface-name">--</span></div>
+    </div>
+  </div>
+
+  <div class="header-stats">
+    <div class="hstat">
+      <span class="label">运行时长</span>
+      <span class="value" id="uptime">--</span>
+    </div>
+    <div class="hstat">
+      <span class="label">更新时间</span>
+      <span class="value" id="update-time">--</span>
+    </div>
+    <div class="hstat">
+      <span class="label">数据新鲜度</span>
+      <span class="value" id="freshness"><span class="pill pending">连接中…</span></span>
+    </div>
+  </div>
+
+  <div class="token-box" id="token-box">
+    <input id="token-input" type="password" placeholder="访问令牌 (token)" autocomplete="off" spellcheck="false">
+    <button id="token-save" class="btn" type="button">保存</button>
+    <button id="token-clear" class="btn ghost" type="button">清除</button>
+  </div>
+</header>
+
+<main>
+
+  <section class="cards" id="metric-cards">
+    <div class="card metric">
+      <div class="metric-head">
+        <span class="metric-icon rx" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 5v14M19 12l-7 7-7-7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="metric-title">本月入站流量</span>
+      </div>
+      <div class="metric-value" id="month-rx">--</div>
+      <div class="metric-sub" id="month-rx-sub">等待月度数据…</div>
+    </div>
+
+    <div class="card metric">
+      <div class="metric-head">
+        <span class="metric-icon tx" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="metric-title">本月出站流量</span>
+      </div>
+      <div class="metric-value" id="month-tx">--</div>
+      <div class="metric-sub" id="month-tx-sub">等待月度数据…</div>
+    </div>
+
+    <div class="card metric">
+      <div class="metric-head">
+        <span class="metric-icon cpu" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15"><rect x="7" y="7" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </span>
+        <span class="metric-title">CPU 使用率</span>
+      </div>
+      <div class="metric-value" id="cpu-value">--</div>
+      <div class="progress"><div class="bar bar-cpu" id="cpu-bar" style="width:0%"></div></div>
+    </div>
+
+    <div class="card metric">
+      <div class="metric-head">
+        <span class="metric-icon mem" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15"><rect x="4" y="8" width="16" height="9" rx="2" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M8 8v9M12 8v9M16 8v9" stroke="currentColor" stroke-width="1.8"/></svg>
+        </span>
+        <span class="metric-title">内存占用</span>
+      </div>
+      <div class="metric-value" id="mem-value">--</div>
+      <div class="metric-sub" id="mem-sub">--</div>
+      <div class="progress"><div class="bar bar-mem" id="mem-bar" style="width:0%"></div></div>
+    </div>
+
+    <div class="card metric">
+      <div class="metric-head">
+        <span class="metric-icon disk" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="15" height="15"><ellipse cx="12" cy="12" rx="8" ry="4.5" stroke="currentColor" stroke-width="1.8" fill="none"/><path d="M4 12v4.5c0 2.5 3.6 4.5 8 4.5s8-2 8-4.5V12" stroke="currentColor" stroke-width="1.8" fill="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/></svg>
+        </span>
+        <span class="metric-title">磁盘占用</span>
+      </div>
+      <div class="metric-value" id="disk-value">--</div>
+      <div class="metric-sub" id="disk-sub">--</div>
+      <div class="progress"><div class="bar bar-disk" id="disk-bar" style="width:0%"></div></div>
+    </div>
+  </section>
+
+  <section class="charts">
+
+    <div class="card chart-card chart-card-wide">
+      <div class="card-head">
+        <h2>实时网络速率</h2>
+        <div class="badge" id="rate-badge">近 30 分钟 · 入站 -- / 出站 --</div>
+      </div>
+      <div id="chart-rate" class="chart"></div>
+    </div>
+
+    <div class="card chart-card">
+      <div class="card-head">
+        <h2>系统负载</h2>
+        <div class="badge">CPU / 内存 / 磁盘</div>
+      </div>
+      <div id="chart-gauges" class="chart"></div>
+    </div>
+
+    <div class="card chart-card chart-card-full">
+      <div class="card-head">
+        <h2>近 12 个月流量</h2>
+        <div class="badge" id="monthly-badge">月度入站 / 出站（字节）</div>
+      </div>
+      <div id="chart-monthly" class="chart"></div>
+    </div>
+
+  </section>
+
+  <div class="empty-hint" id="empty-hint" hidden>
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" fill="none" stroke-dasharray="3 4" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="2.4s" repeatCount="indefinite"/></circle><path d="M12 8v5M12 16.5v.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <span id="empty-hint-text">正在等待首个采样点…（约一个采集间隔后出现数据）</span>
+  </div>
+
+</main>
+
+<footer>
+  <span>vpsmon · 数据每 5 秒刷新</span>
+  <span class="sep">·</span>
+  <span id="footer-meta">样本 -- · 数据库 --</span>
+  <span class="sep">·</span>
+  <span>统计网卡 <b id="footer-iface">--</b></span>
+</footer>
+
+<div class="modal" id="token-modal" hidden>
+  <div class="modal-mask"></div>
+  <div class="modal-card">
+    <h3>需要访问令牌</h3>
+    <p>该服务已开启 token 鉴权，请输入访问令牌后继续。</p>
+    <input id="modal-token-input" type="password" placeholder="访问令牌 (token)" autocomplete="off" spellcheck="false">
+    <div class="modal-actions">
+      <button id="modal-token-cancel" class="btn ghost" type="button">取消</button>
+      <button id="modal-token-save" class="btn" type="button">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/echarts.min.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

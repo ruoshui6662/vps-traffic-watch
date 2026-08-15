@@ -1,0 +1,66 @@
+# VPS 流量统计监控系统 systemd 单元文件
+# 由 install.sh 复制到 /etc/systemd/system/vpsmon.service
+# 安装/卸载/启停:  systemctl {enable --now, disable --now, status, restart} vpsmon
+#
+# 安全加固依据: docs/SECURITY.md §4.9（M7/M8）
+#   - /opt/vpsmon 归 root:root 只读（install.sh 已去掉 chown -R vpsmon）；
+#     ProtectSystem=strict 在运行期强制除 ReadWritePaths 外全部只读（含 /opt）。
+#   - 服务以 User=vpsmon 降权运行，UMask=0077 保证 SQLite 新建文件默认 600。
+#   - 以下指令中，ProtectClock/ProtectKernelLogs/ProtectProc 需要 systemd >= 241/244/245；
+#     老版本 systemd（如 CentOS 7 的 219）不识别会报错，请按需删除对应行。
+
+[Unit]
+Description=VPS Monitor - traffic statistics web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpsmon
+Group=vpsmon
+# 入口: venv python 运行 vpsmon 包; 配置指向 /var/lib/vpsmon/config.json
+ExecStart=/opt/vpsmon/venv/bin/python /opt/vpsmon/vpsmon/app.py --config /var/lib/vpsmon/config.json
+WorkingDirectory=/opt/vpsmon
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# ---- 安全加固: 程序目录只读、仅数据目录可写、最小权限（SECURITY.md §4.9）----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict          # 更强：除 ReadWritePaths 外全只读（含 /opt/vpsmon，M7）
+ProtectHome=true
+ReadWritePaths=/var/lib/vpsmon
+UMask=0077                    # SQLite vpsmon.db/-wal/-shm 默认 600
+
+# ---- 新增（与 Python3/psutil 兼容，建议全部启用）----
+ProtectKernelTunables=true    # psutil 只读 /proc/sys，不受影响
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectProc=invisible         # psutil 读 /proc/stat、/proc/net、/proc/meminfo 为顶层文件，兼容；部署后实测确认
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+PrivateDevices=true           # 提供私有 /dev（含 urandom，Python secrets 可用）
+CapabilityBoundingSet=        # 空集合：服务无需任何 capability
+SystemCallArchitectures=native
+RemoveIPC=true
+RestrictNamespaces=true
+
+# ---- 不启用（与 Python/psutil 不兼容，务必保留注释说明，不要打开）----
+# MemoryDenyWriteExecute=true  # CPython/libffi（psutil 的 C 扩展）需要 W^X 内存映射，
+#                              # 启用后服务启动即崩溃（实测文档记录）
+# ProcSubset=pid               # psutil 依赖完整 /proc（/proc/net/dev、/proc/stat 等），
+#                              # 启用后采集全部失效
+# PrivateUsers=true            # 改变文件属主映射语义，易致数据目录权限错乱
+# IPAddressDeny=any            # 会阻断服务自身创建监听 socket，导致无法绑定端口
+
+# ---- 可用但需逐项实测（本期不强制）----
+# RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# SystemCallFilter=@system-service   # Python 动态特性多，需充分回归
+
+[Install]
+WantedBy=multi-user.target
