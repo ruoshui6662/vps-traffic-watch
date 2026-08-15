@@ -4,7 +4,8 @@
 加载顺序（§4.2）：
     1. --config 显式路径（优先级最高）；
     2. 环境变量 VPSMON_CONFIG 指向的路径；
-    3. 探测 /var/lib/vpsmon/config.json → 当前工作目录 ./config.json；
+    3. 探测 /var/lib/vpsmon/config.json → /etc/vpsmon/config.json（OpenWrt）→
+       当前工作目录 ./config.json；
     4. 均不存在 → 内置默认值（db 落在当前工作目录 ./vpsmon.db）。
 
 读取后逐字段校验并回退默认值（不回写文件）；JSON 解析失败 → 日志 + 默认值，
@@ -50,9 +51,11 @@ DEFAULTS = {
     "trusted_proxy": "",
 }
 
-# 探测顺序（SPEC §4.2.3）
+# 探测顺序（SPEC §4.2.3；§13.3.4 追加 OpenWrt 路径 /etc/vpsmon/config.json——
+# /var 在 OpenWrt 为 tmpfs 重启清空，配置放 overlay 的 /etc/vpsmon）
 PROBE_PATHS = (
     "/var/lib/vpsmon/config.json",
+    "/etc/vpsmon/config.json",
     "config.json",   # 相对当前工作目录
 )
 

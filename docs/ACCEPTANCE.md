@@ -101,3 +101,109 @@
 | 8 | 安装流程（管道必须端口/交互重试/token 自动生成打印） | ✅ 代码审查 + 逻辑模拟 |
 
 **最终结论：T1/T2/T3 交付物通过 T4 验收，可交付。**
+
+---
+
+## 8. T8 安全复审结论（OpenWrt 支持 + 标准库双后端 + 发布面）— 追加
+
+- 复审人：ow_researcher（架构师，任务 t8）；依据 docs/SECURITY.md §9（完整记录）
+- 复审对象：T4（`procmetrics.py`/`security.py`/`stdserver.py`/api 纯处理器/app 双后端）、T5（install.sh/uninstall.sh OpenWrt 分支）、T7（systemd 单元分档与行尾注释修复）、发布面
+- 结论：**未发现可利用漏洞（无高危/中危）**；T4/T5/T7 交付物通过 T8 安全复审。
+
+### 8.1 回归实测（T8 复审环境：本机无 flask/psutil = OpenWrt stdlib 模拟；.piptmp/vendor 提供 Flask 3.1.3）
+
+| 套件 | 结果 |
+|---|---|
+| storage / config / collector | ✅ 全过（collector 20/20 走 psutil 缺失 → /proc 路径）|
+| procmetrics 自检 | ✅ 22/22 |
+| security 自检 | ✅ 47/47 |
+| stdserver 自检（含双后端逐字段契约对比）| ✅ 38/38（T8 新增 1 项）|
+| api 冒烟（Flask）| ✅ 55/55 无回归 |
+| app 端到端（Flask）| ✅ 51/51 无回归 |
+| app 直接脚本执行（`python vpsmon/app.py --selftest`）| ✅ stdlib 链全过 |
+| 双后端门序探针（`.devtest/t8_probe.py`）| ✅ 确认 §4.12-5 差异 |
+
+### 8.2 T8 修复项
+
+1. **`.gitignore` 残留目录缺口**：`vpsmon_x_*/` → `vpsmon_*_test_*/`（覆盖 proc/http/config/app 自检残留目录）。
+2. **stdlib 门序断言锁定**：stdserver 自检新增"白名单外 POST 已知端点 → 403（先于 405）"，锁定白名单优先语义。
+
+### 8.3 T7 复核确认
+
+- ✅ `vpsmon.service` 模板与 install.sh 生成单元值行无行尾注释；selftest 含守卫（install.sh 自检段）。
+- ✅ 三档门限（219/229/230/231/233/244）断言完备，版本不足指令绝不出现在单元里。
+- ✅ `ExecStart` 为 `-m vpsmon.app` 模式，路径正确。
+- ⚠️ install.sh `--selftest` 需 bash，Windows 本机未执行（环境限制）；建议在 Linux 实测终验。
+
+### 8.4 复核结论对照（SECURITY.md §9.4/§9.5）
+
+- ✅ stdserver 静态穿越防护 / Host 校验 / 安全门顺序 / 限流白名单一致性 / TLS fail-closed / 日志脱敏
+- ✅ procmetrics 纯文件解析无注入面 / procd 参数引号安全 / uci 段名精确撤销 / /etc/vpsmon 权限（config 600、目录 700）/ PROBE_PATHS 顺序
+- ✅ 发布面：.gitignore 全覆盖、README 占位符、无硬编码密钥、无 CDN 兜底
+- ✅ OpenWrt root 无降权暴露面已文档化（SECURITY §4.12-1：bind 127.0.0.1/LAN + allow_ips + uci src=lan + 反代/TLS 配置示例）
+
+**最终结论：T4/T5/T7 交付物通过 T8 安全复审，可交付。**
+
+---
+
+## 9. T6 双平台回归验收 + OpenWrt 文档（reviewer 交付）— 追加
+
+- 验收人：ow_reviewer（验证与文档，任务 t6）
+- 验收日期：2026-08-15
+- 验收对象：T1–T8 全部交付物（双平台回归）+ README OpenWrt 章节 + 发布面
+- 结论：**全部验收项 PASS**；代码层面未发现需修复的缺陷（0 修复）；发布面清理 2 类残留（T7 调试脚本、探测残留库/空目录）；2 项环境限制已记录（Windows 沙箱禁 bash 执行、空目录 ACL 锁定）。
+
+### 9.1 回归测试结果（本机 Python 3.12.10；Flask 3.1.3 via .piptmp/vendor；psutil 缺失 = OpenWrt stdlib 模拟）
+
+| 路径 | 套件 | 命令 | 结果 |
+|---|---|---|---|
+| Flask | api 冒烟 | `PYTHONPATH=.piptmp\vendor python -m vpsmon.api` | **55/55** |
+| Flask | app 端到端 | `PYTHONPATH=... python -m vpsmon.app --selftest` | **51/51** |
+| Flask | stdserver（含双后端契约对比） | `PYTHONPATH=... python -m vpsmon.stdserver --self-test` | **51/51**（13 项契约全一致） |
+| stdlib | procmetrics | `python -m vpsmon.procmetrics --self-test` | **22/22** |
+| stdlib | security | `python -m vpsmon.security --self-test` | **47/47** |
+| stdlib | collector | `python -m vpsmon.collector --self-test` | **20/20** |
+| stdlib | stdserver | `python -m vpsmon.stdserver --self-test` | **38/38** |
+| stdlib | storage / config | `python -m vpsmon.storage` / `python -m vpsmon.config` | 全过 / **26/26** |
+| T1 | 直接脚本执行（Flask） | `python vpsmon\app.py --selftest` | **51/51** |
+| T1 | 直接脚本执行（stdlib） | `python vpsmon\app.py --selftest` | stdlib 链全过 |
+| T1 | `-m` 执行（stdlib） | `python -m vpsmon.app --selftest` | stdlib 链全过 |
+| 双后端 | 契约逐字段 | stdserver 自检 `compare()`：6 端点 + 3 错误路径 + 静态页/穿越 | **status 与 body 逐字相等** |
+
+> 说明：Windows 本机无 `/proc`，`/api/status` 实时采集打印 WARNING 并回退库内样本——属 api.py 设计内的单点失败降级，非失败。全部断言 PASS，进程真实退出码 0（早前 `2>&1` 包装显示 exit 1 为 PowerShell stderr 错误记录伪影，已用重定向到文件 + `$LASTEXITCODE` 复核确认）。
+
+### 9.2 install.sh / uninstall.sh 静态审查
+
+| 项 | 结果 |
+|---|---|
+| 结构平衡（Python 状态机：剥 heredoc/注释/字符串后配对） | ✅ install.sh 与 uninstall.sh 的 if/fi、case/esac、for..done 全部配对（正确处理单行 `if..fi`/`case..esac` 与多行 `if/elif/else; fi` 形式） |
+| heredoc 配对 / 引号 / 花括号 / `$()` 上下文 | ✅ `_t7_unit_check.py` 状态机断言全过（运行后已删除该调试脚本） |
+| systemd 单元分档生成矩阵（v219/228/229/230/231/233/244/254） | ✅ `_t7_unit_check.py`：**ALL PASSED**——含/不含断言、档位标签、T7 值行无行尾注释守卫 |
+| vpsmon.service 参考模板 | ✅ 值行无行尾注释；`ExecStart=-m vpsmon.app`；完整档指令齐全；不兼容项注释保留 |
+| OpenWrt 分支隔离 | ✅ 7 个 OpenWrt 函数体（is_openwrt/openwrt_install_service/openwrt_start_and_check/openwrt_firewall_allow/openwrt_firewall_revoke/openwrt_do_uninstall/openwrt_print_success）均无 systemctl/journalctl/apt/dnf/yum/apk 引用；常量与关键片段（opkg update / `import sqlite3, http.server` 模块校验 / procd_open_instance / respawn / uci）全部在位 |
+| `bash -n` / `bash install.sh --selftest` | ⚠️ 环境限制：沙箱禁 signal pipe（Git Bash 启动即崩，与 T8 §8.3 记录一致）；已用 `_t7_unit_check.py`（Windows 等价实现）替代验证并全过；建议发布前在 Linux 实机跑一次 `bash install.sh --selftest` |
+
+### 9.3 README.md OpenWrt 文档（本任务交付，逐项核对）
+
+- ✅ **新增"OpenWrt 路由器支持"章节**：前置要求（`opkg update` / 完整版 `python3` 含 sqlite3+http.server / Flash ≥16MB）；安装命令（本地 + 远程一行，`--port` 必填说明）；procd 管理表（`/etc/init.d/vpsmon status|start|stop|restart|enable|disable` + `logread` 日志）；数据目录 `/etc/vpsmon`（`/var` 为 tmpfs 重启清空的说明 + overlay 持久化验证）；uci 防火墙（安装自动放行说明 + 手动示例）；安全建议（bind 127.0.0.1 / allow_ips / uci src=lan / TLS·反代见 SECURITY §4.12）；卸载命令；已知限制（logread 替代 journalctl、python3-light 误装排查、小内存/overlay WAL 自动回退）。
+- ✅ **新增"系统要求"章节**：Linux VPS / OpenWrt / NAS（无 Flask 自动 stdlib 模式）/ Windows 四平台要求表 + 双后端自动选择说明（6 端点逐字段一致）。
+- ✅ 同步更新：简介双后端技术栈、功能特性新增 OpenWrt/NAS、文件位置（部署态）拆 VPS/OpenWrt 两表、配置加载顺序补 `/etc/vpsmon/config.json`、一键卸载补 OpenWrt 分支、目录结构与自检清单补 procmetrics/security/stdserver 模块与 stdlib 自检命令。
+- ✅ README 全文无真实 token/密钥（token 一律 `<token>` 占位符；secret 扫描命中项均为 systemd 指令名误报）。
+
+### 9.4 发布就绪检查
+
+| 项 | 结果 |
+|---|---|
+| git status 核对 | ✅ 变更集 = 12 modified + 3 个新模块（procmetrics/security/stdserver.py），无 config.json/.piptmp/.devtest/.agent-teams/证书/数据库入库 |
+| .gitignore 覆盖 | ✅ `config.json`、`*.db*`、`*.pem`、`*.key`、`.firewall-rule`、`.piptmp/`、`.devtest/`、`.agent-teams/`、`vpsmon_*_test_*/` 均经 `git check-ignore -v` 命中 |
+| 残留清理 | ✅ 删除 T7 调试脚本 `_t7_unit_check.py`、探测残留 `probe_t8.db`、空测试目录；⚠️ 7 个空目录（`tmp*`、`vpsmon_x_zr2yz86q`）ACL 锁定无法删除（沙箱产物，git 不跟踪空目录，不影响发布） |
+| 行尾 / BOM | ✅ 关键文件（README/install.sh/uninstall.sh/vpsmon.service/Python 源码）全部 LF 无 BOM；⚠️ LICENSE 为既有 CRLF（非本特性变更，可选统一） |
+| 无悬空引用 | ✅ 删除的 `_t7*` 脚本在 docs/源码中无任何引用 |
+
+### 9.5 残余风险与建议（接受项）
+
+1. **bash 自检未在本机执行**（沙箱限制）——等效断言已由 `_t7_unit_check.py` 全过；发布前 Linux 实机 `bash install.sh --selftest` 终验一次（与 T8 §8.3 同款建议）。
+2. **OpenWrt 真机未实测**——opkg 安装/procd 启停/uci 撤销/重启持久化为静态审查 + 逻辑模拟；建议发布后按 SPEC §13.6 T5 验收清单在真实设备终验（x86_64 或真实路由器）。
+3. **LICENSE CRLF**——非阻塞，可选统一为 LF。
+
+**最终结论：T1–T8 全部交付物通过 T6 双平台回归验收；README OpenWrt 章节交付完成；发布面就绪。可交付。**

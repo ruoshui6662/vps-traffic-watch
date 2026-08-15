@@ -2,7 +2,7 @@
 
 单机部署的轻量 VPS 流量监控服务：统计所选网卡的**月度入站/出站流量**，同时展示 CPU、内存、磁盘占用与实时速率。一条命令安装，浏览器访问 `http://<IP>:<port>` 即可查看美观的深色仪表盘。
 
-技术栈：**Python 3 + psutil + Flask + SQLite + ECharts**。采集线程每 `interval` 秒写入一条样本，API 只读；一切速率与月度/日度流量由查询时基于内核累计计数**正增量**推导，天然免疫计数器重置与进程重启。
+技术栈：**Python 3 + SQLite + ECharts**。Web 与采集为**双后端自动选择**——Flask/psutil 可用时走标准路径（VPS）；无 Flask/psutil 时自动降级**纯标准库**（`/proc` 采集 + `http.server`，OpenWrt 路由器 / NAS 等精简环境），6 个 API 端点与安全行为两后端**逐字段一致**。采集线程每 `interval` 秒写入一条样本，API 只读；一切速率与月度/日度流量由查询时基于内核累计计数**正增量**推导，天然免疫计数器重置与进程重启。
 
 ---
 
@@ -15,7 +15,19 @@
 - 🔐 **Token 鉴权**：安装时自动生成强随机令牌（默认仅 `X-Token` 请求头，`?token=` 参数默认禁用防日志泄露），恒定时间比较防时序侧信道
 - 🧵 **低资源占用**：SQLite WAL 单写多读；60 秒间隔一年约 52 万行，查询毫秒级
 - 🛡️ **systemd 托管**：开机自启、崩溃自动重启、安全加固（`ProtectSystem=strict` + 最小能力集）
+- 🚀 **OpenWrt / NAS 支持**：无 Flask/psutil 时自动降级纯标准库后端（`/proc` 采集 + `http.server`，零编译依赖）；OpenWrt 上经 **opkg + procd + uci** 一键安装（见"OpenWrt 路由器支持"章节）
 - 🌐 **零外网依赖**：ECharts 本地托管，VPS 无外网也能完整渲染
+
+## 系统要求
+
+| 平台 | 要求 | 说明 |
+|---|---|---|
+| Linux VPS（Debian/Ubuntu/CentOS/Alpine 系） | Python ≥ 3.8 + pip/venv | systemd 托管；单元按目标 systemd 版本分档生成（≥219 通用档 / ≥230 增强档 / ≥244 完整档），版本不足的加固指令不会写入单元 |
+| OpenWrt 路由器（opkg/procd/uci） | **完整版** `python3`（含 sqlite3/http.server）+ 可用 Flash **≥ 16MB** | 纯标准库运行，无 pip/venv/gcc 编译依赖（见"OpenWrt 路由器支持"章节） |
+| NAS 等无 Flask/psutil 环境 | Python ≥ 3.8 | 自动降级纯标准库模式：采集走 `/proc`（procmetrics）、Web 走 `http.server`（stdserver），API 契约与安全基线不变（docs/SPEC.md §13） |
+| Windows（开发调试） | Python ≥ 3.8 | 可直接运行调试；psutil 缺失时系统状态回退库内最近样本，采集/页面可用 |
+
+> **双后端自动选择**：启动时探测 Flask——可用 → Flask 路径；不可用 → 纯标准库路径。两后端共用同一套 `api` 纯处理器与 `security` 安全原语，6 个端点响应（含空库形状、错误体）**逐字段一致**（docs/SPEC.md §13.2）。
 
 ## 界面截图
 
@@ -73,7 +85,7 @@ sudo bash install.sh --port 9090 --interval 30 --token "MyToken123" --iface eth0
 | `--token` | 访问令牌；`--token ""` 显式不鉴权（有公网暴露风险） | **自动生成强随机**（128 bit）；交互安装时可自行输入（留空 = 不鉴权并警告） |
 | `--iface` | 统计网卡名，空 = 自动选择流量最大的网卡 | 空 |
 
-安装脚本自动完成：root 检查 → 端口解析（`--port` > `VPSMON_PORT` > 交互输入 > 非交互报错）→ token 解析（`--token`/`VPSMON_TOKEN` > 自动生成）→ 源码来源检测（本地目录 / GitHub 远程下载，支持 `VPSMON_EXPECTED_SHA256` 校验和）→ 发行版检测（apt/dnf/yum/apk）→ 安装 `python3`/`python3-venv`/`pip` → 创建系统用户 `vpsmon` → 复制程序到 `/opt/vpsmon`（root:root 只读，并自动部署卸载脚本 `uninstall.sh`）→ 创建虚拟环境并安装依赖 → 生成配置 `/var/lib/vpsmon/config.json`（`umask 077` 落盘即 600）→ 安装并启动 systemd 服务 → curl 自检 → 防火墙交互确认放行（记录标记，卸载自动撤销）→ 输出访问地址、token（仅本次显示）与安全提示。
+安装脚本自动完成：root 检查 → 端口解析（`--port` > `VPSMON_PORT` > 交互输入 > 非交互报错）→ token 解析（`--token`/`VPSMON_TOKEN` > 自动生成）→ 源码来源检测（本地目录 / GitHub 远程下载，支持 `VPSMON_EXPECTED_SHA256` 校验和）→ 发行版检测（apt/dnf/yum/apk；OpenWrt 自动走 opkg 分支，见"OpenWrt 路由器支持"章节）→ 安装 `python3`/`python3-venv`/`pip` → 创建系统用户 `vpsmon` → 复制程序到 `/opt/vpsmon`（root:root 只读，并自动部署卸载脚本 `uninstall.sh`）→ 创建虚拟环境并安装依赖 → 生成配置 `/var/lib/vpsmon/config.json`（`umask 077` 落盘即 600）→ 安装并启动 systemd 服务 → curl 自检 → 防火墙交互确认放行（记录标记，卸载自动撤销）→ 输出访问地址、token（仅本次显示）与安全提示。
 
 安装成功后访问：`http://<服务器IP>:<端口>`（本机测试：`curl -H "X-Token: <token>" http://127.0.0.1:<端口>/api/status`）。
 
@@ -103,7 +115,7 @@ Windows 开发机说明：本仓库源码为跨平台 Python，可直接在 Wind
 
 ## 配置说明
 
-配置文件 `config.json`（一键安装位于 `/var/lib/vpsmon/config.json`，手动运行位于当前目录）：
+配置文件 `config.json`（一键安装位于 `/var/lib/vpsmon/config.json`（VPS）或 `/etc/vpsmon/config.json`（OpenWrt），手动运行位于当前目录）：
 
 ```json
 {
@@ -138,18 +150,29 @@ Windows 开发机说明：本仓库源码为跨平台 Python，可直接在 Wind
 | `ssl_certfile` / `ssl_keyfile` | string | 空 | TLS 证书/密钥路径，成对配置且文件存在时启用 HTTPS（详见"安全"章节） |
 | `trusted_proxy` | string | 空 | 信任的反代地址；配置后仅来自该地址的请求采信 `X-Forwarded-For` 首段（限流/白名单取真实客户端 IP） |
 
-配置加载顺序：`--config` 参数 > 环境变量 `VPSMON_CONFIG` > 探测 `/var/lib/vpsmon/config.json` > 当前目录 `./config.json` > 内置默认值。**数据库默认位于配置文件同目录下的 `vpsmon.db`**（例如部署模式 `/var/lib/vpsmon/config.json` → `/var/lib/vpsmon/vpsmon.db`），可用 `--db <path>` 覆盖。
+配置加载顺序：`--config` 参数 > 环境变量 `VPSMON_CONFIG` > 探测 `/var/lib/vpsmon/config.json` > `/etc/vpsmon/config.json`（OpenWrt）> 当前目录 `./config.json` > 内置默认值。**数据库默认位于配置文件同目录下的 `vpsmon.db`**（例如部署模式 `/var/lib/vpsmon/config.json` → `/var/lib/vpsmon/vpsmon.db`；OpenWrt `/etc/vpsmon/config.json` → `/etc/vpsmon/vpsmon.db`），可用 `--db <path>` 覆盖。
 
-配置文件权限：部署模式下 `config.json` 为 `600`（属主 `vpsmon`，`umask 077` 写入），数据目录 `/var/lib/vpsmon` 为 `700`，token 不会暴露给其他用户。
+配置文件权限：部署模式下 `config.json` 为 `600`（属主 `vpsmon`，`umask 077` 写入），数据目录 `/var/lib/vpsmon`（OpenWrt 为 `/etc/vpsmon`）为 `700`，token 不会暴露给其他用户。
 
 ### 文件位置（部署态）
+
+**Linux VPS（systemd）**：
 
 | 路径 | 内容 |
 |---|---|
 | `/opt/vpsmon/` | 程序包 `vpsmon/` + `requirements.txt` + 虚拟环境 `venv/` + 卸载脚本 `uninstall.sh` |
 | `/var/lib/vpsmon/config.json` | 配置（含 token，权限 600） |
 | `/var/lib/vpsmon/vpsmon.db` | SQLite 数据库（WAL 模式，`-wal`/`-shm` 同目录） |
-| `/etc/systemd/system/vpsmon.service` | systemd 单元 |
+| `/etc/systemd/system/vpsmon.service` | systemd 单元（按目标版本分档生成） |
+
+**OpenWrt（procd，见"OpenWrt 路由器支持"章节）**：
+
+| 路径 | 内容 |
+|---|---|
+| `/opt/vpsmon/vpsmon/` | 程序包（纯标准库，无 venv/pip） |
+| `/etc/vpsmon/config.json` | 配置（含 token，权限 600；overlay 持久） |
+| `/etc/vpsmon/vpsmon.db` | SQLite 数据库（WAL；`-wal`/`-shm` 同目录） |
+| `/etc/init.d/vpsmon` | procd init 脚本 |
 
 ---
 
@@ -267,6 +290,111 @@ systemctl disable --now vpsmon   # 停止并取消开机自启
 
 ---
 
+## OpenWrt 路由器支持
+
+vpsmon 在 OpenWrt 上以**纯标准库**运行（无 Flask/psutil/pip/venv，无需 gcc 编译），由 install.sh 自动识别发行版并走 **opkg + procd + uci** 分支；API 契约与安全基线（docs/SECURITY.md §4.12）与 VPS 版一致。
+
+### 前置要求
+
+1. **软件源**：系统为 OpenWrt（或含 opkg 的派生固件），先更新：
+   ```bash
+   opkg update
+   ```
+2. **完整版 python3**：`python3-light` 缺 sqlite3/http.server 等模块（启动即崩），必须安装完整包（install.sh 会自动安装并做模块校验）：
+   ```bash
+   opkg install python3 curl ca-bundle
+   python3 -c 'import sqlite3, http.server, json, ssl, socketserver'
+   ```
+3. **存储空间 ≥ 16MB**：python3 完整包安装后占用 10–20MB+，先 `df -h /` 确认 overlay 可用空间；不足时 install.sh 会明确报错退出（不静默）。
+
+### 安装
+
+**本地安装**（把项目目录放到路由器上，如 `/root/vpsmon`）：
+
+```bash
+cd /root/vpsmon
+bash install.sh --port 9090 --token "你的令牌"
+```
+
+**远程一行安装**（OpenWrt 惯例以 root 直接执行，无需 sudo；**管道模式 stdin 非终端必须显式指定 `--port`**）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ruoshui6662/vps-traffic-watch/main/install.sh | bash -s -- --port 9090
+```
+
+> `--port` **必填**：OpenWrt 分支沿用 VPS 版端口解析规则——非交互/管道模式不提供 `--port`（或 `VPSMON_PORT`）即报错退出，不静默默认 8080。token 默认自动生成强随机 128bit（仅本次安装输出显示，请妥善保存）。
+
+安装后自检：`curl -H "X-Token: <token>" http://127.0.0.1:9090/api/status` 应返回 `"ok": true`。
+
+### procd 服务管理（替代 systemctl）
+
+OpenWrt 无 systemd，服务由 procd 管理，init 脚本为 `/etc/init.d/vpsmon`（START=99 / STOP=10，`respawn` 崩溃自动拉起，等价 systemd `Restart=always`）：
+
+| 操作 | 命令 |
+|---|---|
+| 状态 | `/etc/init.d/vpsmon status` |
+| 启动 / 停止 / 重启 | `/etc/init.d/vpsmon start` / `stop` / `restart` |
+| 开机自启（启用 / 禁用） | `/etc/init.d/vpsmon enable` / `disable` |
+| 查看日志 | `logread \| grep vpsmon`（实时：`logread -f \| grep vpsmon`） |
+
+> 无 journalctl：应用与访问日志经 logd 环形缓冲，用 `logread` 查看；访问日志查询串同样脱敏（`?token=xxx` → `?redacted`），token 不出日志。
+
+### 数据目录：/etc/vpsmon（overlay 持久化）
+
+OpenWrt 的 `/var`（常符号链接到 `/tmp`）与 `/tmp` 是 **tmpfs，重启即清空**；因此配置与数据库放在 overlay 文件系统的 **`/etc/vpsmon`**（重启保留），路径如下：
+
+| 路径 | 内容 |
+|---|---|
+| `/opt/vpsmon/vpsmon/` | 程序包（root:root 只读，无 venv/pip） |
+| `/etc/vpsmon/config.json` | 配置（含 token，权限 600） |
+| `/etc/vpsmon/vpsmon.db` | SQLite 数据库（WAL；`-wal`/`-shm` 同目录） |
+| `/etc/init.d/vpsmon` | procd init 脚本 |
+| `/etc/rc.d/S99vpsmon` | enable 生成的开机自启链接 |
+
+持久性验证：重启后 `ls /etc/vpsmon/vpsmon.db` 应仍存在（`df -h /etc` 确认 overlay）。
+
+### 防火墙（uci）
+
+安装时**交互确认**后自动放行（默认仅 `src=lan` 来源，规则 name=vpsmon，段名写入 `/etc/vpsmon/.firewall-rule` 标记，卸载自动精确撤销；非交互模式只提示不放行）。手动放行示例：
+
+```bash
+uci add firewall rule
+uci set firewall.@rule[-1].name='vpsmon'
+uci set firewall.@rule[-1].src='lan'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].dest_port='9090'
+uci set firewall.@rule[-1].target='ACCEPT'
+uci commit firewall
+/etc/init.d/firewall reload
+```
+
+### 安全建议（OpenWrt 以 root 运行）
+
+OpenWrt 上服务以 **root 运行**（procd 惯例，无降权用户），**仅供可信网络 / 本机使用**。推荐配置（编辑 `/etc/vpsmon/config.json` 后 `/etc/init.d/vpsmon restart` 生效）：
+
+- `"bind": "127.0.0.1"`（纯本机）或路由器 LAN IP（如 `"bind": "192.168.1.1"`）；
+- `"allow_ips": ["192.168.1.0/24"]`（应用层 403 兜底，忘记 token 也不裸奔）；
+- token 安装时**强制默认生成**，勿外传；忘记可编辑 config.json 后重启；
+- uci 防火墙**只放行 lan 来源**，不建议 wan 直接放行；
+- WAN 访问必须走反向代理（opkg 装 nginx/HAProxy + TLS）或自签证书（`opkg install openssl-util` 后按 docs/SECURITY.md §4.5 生成），**禁止公网明文 HTTP 暴露**（完整示例见 docs/SECURITY.md §4.12）。
+
+### 卸载
+
+```bash
+bash /opt/vpsmon/uninstall.sh                # 卸载（默认保留数据）
+bash /opt/vpsmon/uninstall.sh --keep-data    # 显式保留 /etc/vpsmon 数据
+```
+
+卸载动作：停止并禁用服务 → 撤销 uci 防火墙规则（标记缺失则不撤销，避免误删用户既有规则）→ 删除 init 脚本与 `/opt/vpsmon` → 按确认/`--keep-data` 决定是否删除 `/etc/vpsmon`（默认保留；非交互强制保留）。**不会卸载 python3/curl/ca-bundle 等 opkg 包**（可能被其他包依赖，超出本应用职责）。
+
+### 已知限制
+
+- **日志方式不同**：无 systemd/journalctl，用 `logread | grep vpsmon`（procd 的 `stdout/stderr` 送 logd）；
+- **python3-light 误装排查**：若启动报 `ModuleNotFoundError: sqlite3`/`http.server` 等，说明装成了精简版——执行 `opkg remove python3-light && opkg install python3` 后重跑安装（install.sh 装后即校验，安装阶段就会报错指引）；
+- 小内存（64–256MB）设备建议保持 `interval=60`（下限 5）并配合默认 `rate_limit=60`；`/etc/vpsmon` 位于 overlay（jffs2/ubifs），SQLite WAL 不可用时会自动回退 `journal_mode=DELETE`（无需配置）。
+
+---
+
 ## API 一览
 
 所有接口位于 `/api`，成功响应统一为 `{"ok": true, "data": ...}`，失败为 `{"ok": false, "error": "..."}`。字节单位一律为 **bytes**（前端负责换算）。多网卡端点支持可选 `?iface=<name>`，缺省 = 当前所选网卡。
@@ -321,6 +449,8 @@ sudo bash uninstall.sh
 | 程序目录 | `/opt/vpsmon` | 程序包 `vpsmon/` + `venv/` + `uninstall.sh` 自身（脚本已载入内存，删除不影响执行） |
 | 数据目录 | `/var/lib/vpsmon` | `config.json` + `vpsmon.db`；**默认保留**（见下） |
 | 系统用户 | `vpsmon` | `userdel vpsmon`（删除失败时提示手动处理） |
+
+> OpenWrt 平台自动走 procd/uci 分支（停止并禁用 `/etc/init.d/vpsmon` → 撤销 uci 防火墙规则 → 删除 init 脚本与 `/opt/vpsmon` → 决定是否删除 `/etc/vpsmon`），详见"OpenWrt 路由器支持"章节的卸载说明。
 
 ### 数据目录保留策略
 
@@ -417,21 +547,24 @@ ls /var/lib/vpsmon             # 数据目录默认保留；如已确认删除�
 
 ```
 vpsmon/
-├── install.sh / uninstall.sh   # 一键安装 / 卸载脚本（端口交互输入、token 自动生成、防火墙自动放行与撤销）
-├── requirements.txt            # flask==3.1.3, psutil==7.2.2（精确 pin）
-├── vpsmon.service              # systemd 单元模板（ProtectSystem=strict + 最小权限）
-├── docs/SECURITY.md            # 安全审计与加固方案（威胁模型、风险清单、验收清单）
-├── docs/SPEC.md                # 技术规格说明（API 契约、算法、部署细节）
+├── install.sh / uninstall.sh   # 一键安装 / 卸载脚本（Linux systemd 分支 + OpenWrt opkg/procd/uci 分支；端口交互输入、token 自动生成、防火墙自动放行与撤销）
+├── requirements.txt            # flask==3.1.3, psutil==7.2.2（精确 pin；OpenWrt 分支不安装）
+├── vpsmon.service              # systemd 单元参考模板（ProtectSystem=strict + 最小权限；install.sh 按版本分档生成）
+├── docs/SECURITY.md            # 安全审计与加固方案（威胁模型、风险清单、验收清单、OpenWrt §4.12）
+├── docs/SPEC.md                # 技术规格说明（API 契约、算法、部署细节、OpenWrt §13）
 └── vpsmon/
-    ├── app.py                  # 入口：配置→存储→采集线程→Flask；安全响应头/Host 校验/日志脱敏
-    ├── config.py               # 配置加载/校验/回退（含 bind/allow_ips/rate_limit/TLS 等安全字段）
-    ├── collector.py            # 采集线程：psutil 采样→写库；网卡自动选择
-    ├── storage.py              # SQLite：建表/WAL/正增量聚合查询
-    ├── api.py                  # Flask Blueprint：6 端点 + 恒定时间鉴权/限流/白名单/参数校验
+    ├── app.py                  # 入口：配置→存储→采集线程→双后端自动选择（Flask / stdlib）；安全响应头/Host 校验/日志脱敏
+    ├── config.py               # 配置加载/校验/回退（含 bind/allow_ips/rate_limit/TLS 等安全字段；探测含 /etc/vpsmon/config.json）
+    ├── collector.py            # 采集线程：psutil 采样→写库（缺失自动切 /proc）；网卡自动选择
+    ├── procmetrics.py          # /proc 采集后端（OpenWrt 纯标准库：net_dev/cpu/meminfo/statvfs/uptime）
+    ├── security.py             # 框架无关安全原语（鉴权/限流/白名单/安全头/Host 校验，双后端复用）
+    ├── api.py                  # 6 端点纯处理器 + Flask 蓝图薄适配（恒定时间鉴权/限流/白名单/参数校验）
+    ├── stdserver.py            # 纯标准库 HTTP 服务器（OpenWrt 后端：ThreadingHTTPServer + 路由/安全门/静态文件/TLS）
+    ├── storage.py              # SQLite：建表/WAL（失败自动回退 DELETE）/正增量聚合查询
     └── static/                 # 仪表盘前端（ECharts 本地化，无 CDN 兜底）
 ```
 
-- **自检**（开发验证）：`python -m vpsmon.storage`、`python -m vpsmon.collector --self-test`、`python -m vpsmon.api`（需 Flask）、`python -m vpsmon.config`、`python -m vpsmon.app --selftest`。
+- **自检**（开发验证）：`python -m vpsmon.storage`、`python -m vpsmon.collector --self-test`、`python -m vpsmon.api`（需 Flask）、`python -m vpsmon.config`、`python -m vpsmon.app --selftest`；stdlib 路径（无 Flask/psutil，模拟 OpenWrt）：`python -m vpsmon.procmetrics --self-test`、`python -m vpsmon.security --self-test`、`python -m vpsmon.stdserver --self-test`（有 Flask 时含双后端逐字段契约对比）、`python vpsmon/app.py --selftest`（直接脚本执行，T1 兼容层）。install.sh 提供 `bash install.sh --selftest`（systemd 单元分档 + OpenWrt 分支静态断言）。
 
 ---
 

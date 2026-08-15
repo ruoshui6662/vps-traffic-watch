@@ -14,21 +14,21 @@
     非空时仅白名单内 IP 可访问 /api/*，其余 403 {"ok":false,"error":"forbidden"}；
   * 参数校验：iface 字符集 ^[A-Za-z0-9._-]{1,64}$，非法 400。
   * 检查顺序：白名单(403) → 限流(429) → 鉴权(401) → 参数校验(400)。
-- psutil 缺失/失败时 status/interfaces 降级：回退到库内最新样本与运行态属性。
+- psutil 缺失/失败时 status/interfaces 降级：自动切换 /proc 采集后端
+  （procmetrics，SPEC §13.2.1），仍失败回退到库内最新样本与运行态属性。
+
+架构（SPEC §13.2.2）：6 端点逻辑为**框架无关纯处理器** handle_*（Flask 蓝图与
+stdlib Handler 共用），安全原语抽取到 security.py（鉴权/限流/白名单/参数边界），
+本模块 Flask 蓝图仅作薄适配：request → security 安全门 → 纯处理器 → jsonify。
 
 Flask 未安装时本模块仍可导入（create_blueprint 调用时才要求 Flask），
-便于 py_compile 与静态检查；自检：python -m vpsmon.api（需 Flask）。
+便于 py_compile、静态检查与 stdlib 后端共用；自检：python -m vpsmon.api（需 Flask）。
 """
 
 import functools
-import hmac
-import ipaddress
 import logging
 import os
-import re
-import threading
 import time
-from collections import deque
 from datetime import datetime
 
 try:
@@ -45,6 +45,8 @@ except ImportError:
 
 from .collector import _VIRT_PREFIXES
 from . import storage as storage_mod
+from vpsmon import procmetrics as procmetrics_mod
+from vpsmon import security as security_mod
 
 log = logging.getLogger("vpsmon.api")
 
@@ -63,167 +65,225 @@ def configure(cfg, storage, collector=None) -> None:
 
 # ---------------------------------------------------------------- 工具
 
-_IFACE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+def resolve_iface(params, collector) -> str:
+    """?iface= 缺省 = 当前所选网卡（SPEC §6.0）；均无 → ""。
 
-
-def _client_ip() -> str:
-    """请求来源 IP（SECURITY §4.2/§4.3）。
-
-    默认取 request.remote_addr（防 XFF 伪造）；仅当配置 trusted_proxy 且请求
-    确实来自该代理地址时，才采信 X-Forwarded-For 首段（反代场景真实客户端）。
+    params: 已解析的请求参数映射（Flask request.args 或 stdlib parse_qs 首值，
+    均支持 .get(name) 返回首值/None）。
     """
-    addr = request.remote_addr or ""
-    trusted = (_cfg.get("trusted_proxy") or "").strip()
-    if trusted and addr == trusted:
-        xff = (request.headers.get("X-Forwarded-For") or "").strip()
-        if xff:
-            first = xff.split(",")[0].strip()
-            if first:
-                addr = first
-    return addr
-
-
-def _ip_allowed(ip: str) -> bool:
-    """IP 白名单判定（SECURITY §4.3）：allow_ips 空 = 不限制；
-    命中任一 IP/CIDR 条目放行；IPv4-mapped IPv6（::ffff:a.b.c.d）归并到 IPv4。"""
-    entries = _cfg.get("allow_ips") or []
-    if not entries:
-        return True
-    try:
-        cand = ipaddress.ip_address(ip.split("%", 1)[0].strip() or ip)
-        if isinstance(cand, ipaddress.IPv6Address) and cand.ipv4_mapped is not None:
-            cand = cand.ipv4_mapped
-    except ValueError:
-        return False
-    for e in entries:
-        try:
-            if "/" in e:
-                net = ipaddress.ip_network(e, strict=False)
-                if cand.version == net.version and cand in net:
-                    return True
-            else:
-                other = ipaddress.ip_address(e.split("%", 1)[0].strip() or e)
-                if cand == other:
-                    return True
-        except ValueError:
-            continue
-    return False
-
-
-def _rate_limit_value() -> int:
-    """rate_limit 配置（默认 60；0/负 = 关闭限流）。"""
-    v = _cfg.get("rate_limit", 60)
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return 60
-    return v if v > 0 else 0
-
-
-def _rate_allowed(ip: str, limit: int, lock, hits) -> bool:
-    """内存滑动窗口限流（SECURITY §4.2）：60 秒窗口内最多 limit 次。
-
-    hits: dict[ip, deque[time.monotonic()]]；窗口裁剪后计数，超限拒绝；
-    桶数 > 4096 时清理空桶（内存有界）。单进程内存态，重启清零（单用户场景
-    可接受，SECURITY §7.3 已文档化）。
-    """
-    now = time.monotonic()
-    with lock:
-        dq = hits.get(ip)
-        if dq is None:
-            dq = deque()
-            hits[ip] = dq
-        while dq and now - dq[0] > 60.0:
-            dq.popleft()
-        if len(dq) >= limit:
-            return False
-        dq.append(now)
-        if len(hits) > 4096:          # 内存有界：清理空桶
-            for k in [k for k, v in hits.items() if not v]:
-                del hits[k]
-        return True
-
-
-def _require_token(view):
-    @functools.wraps(view)
-    def wrapped(*args, **kwargs):
-        token = (_cfg.get("token") or "").strip()
-        if token:
-            # 恒定时间比较（SECURITY H2）；?token= 默认拒绝（H3）
-            provided = request.headers.get("X-Token") or ""
-            ok = hmac.compare_digest(provided, token)
-            if not ok and _cfg.get("allow_url_token", False):
-                q = request.args.get("token") or ""
-                ok = hmac.compare_digest(q, token)
-            if not ok:
-                # 统一 401：不区分缺失/错误/参数位置，不泄露任何数据
-                return jsonify({"ok": False, "error": "unauthorized"}), 401
-        return view(*args, **kwargs)
-    return wrapped
-
-
-def _validate_iface(view):
-    """iface 参数字符集白名单（SECURITY §4.8.4）：^[A-Za-z0-9._-]{1,64}$。"""
-
-    @functools.wraps(view)
-    def wrapped(*args, **kwargs):
-        raw = request.args.get("iface")
-        if raw is not None and raw.strip():
-            if not _IFACE_RE.match(raw.strip()):
-                return jsonify({"ok": False, "error": "invalid iface"}), 400
-        return view(*args, **kwargs)
-    return wrapped
-
-
-def _resolve_iface() -> str:
-    """?iface= 缺省 = 当前所选网卡（SPEC §6.0）；均无 → ""。"""
-    iface = (request.args.get("iface") or "").strip()
+    iface = (params.get("iface") or "").strip()
     if iface:
         return iface
-    if _collector is not None:
-        sel = getattr(_collector, "selected", None)
+    if collector is not None:
+        sel = getattr(collector, "selected", None)
         if sel:
             return sel
     return ""
 
 
-def _clamp_int(raw, default, lo, hi) -> int:
+# ---------------------------------------------------------------- 纯处理器
+# SPEC §13.2.2：6 端点纯函数 handle_*（框架无关，Flask 蓝图与 stdlib Handler
+# 共同调用）。安全门（白名单 403 → 限流 429 → 鉴权 401 → iface 400）由适配层
+# 执行，处理器只负责取数组装。返回 (status_code, body)，body 字段逐条遵守
+# SPEC §6.0–§6.7（含空库形状、time 展示字段、stale_sec、db_bytes 等）。
+
+def handle_status(cfg, storage, collector, iface):
+    """/api/status：实时指标（psutil 或 /proc 后端）→ 回退库内样本与运行态。"""
+    server_time = int(time.time())
+    backend = procmetrics_mod.metrics_backend(psutil_mod=psutil)
+    cpu = mem = disk = uptime = None
+    rx_bytes = tx_bytes = None
+    if backend is not None:
+        try:
+            cpu = backend.cpu_percent()
+        except Exception:
+            log.warning("status: cpu_percent 失败", exc_info=True)
+        try:
+            mem = backend.meminfo()
+        except Exception:
+            log.warning("status: virtual_memory 失败", exc_info=True)
+        try:
+            disk = backend.disk_usage("/")
+        except Exception:
+            log.warning("status: disk_usage 失败", exc_info=True)
+        try:
+            uptime = backend.uptime()
+        except Exception:
+            log.warning("status: boot_time 失败", exc_info=True)
+        if iface:
+            try:
+                io = backend.net_counters().get(iface)
+                if io is not None:
+                    rx_bytes = procmetrics_mod.io_bytes(io, "bytes_recv", "rx_bytes")
+                    tx_bytes = procmetrics_mod.io_bytes(io, "bytes_sent", "tx_bytes")
+            except Exception:
+                log.warning("status: net_io_counters 失败", exc_info=True)
+    ls = storage.latest_sample(iface) if storage is not None and iface else None
+    if cpu is None:
+        cpu = ls["cpu"] if ls else 0.0
+    if mem is None:
+        mem = {"used": ls["mem_used"], "total": ls["mem_total"]} if ls \
+            else {"used": 0, "total": 0}
+    if disk is None:
+        disk = {"used": ls["disk_used"], "total": ls["disk_total"]} if ls \
+            else {"used": 0, "total": 0}
+    if uptime is None:
+        uptime = getattr(collector, "uptime", None) if collector else None
+    if rx_bytes is None:
+        rx_bytes = ls["rx_bytes"] if ls else None
+        tx_bytes = ls["tx_bytes"] if ls else None
+    meta = storage.status_meta(iface) if storage is not None \
+        else {"latest_ts": None, "sample_count": 0}
+    live = storage.live(iface, 5) if storage is not None \
+        else {"rx_rate": 0.0, "tx_rate": 0.0}
+    return 200, {"ok": True, "data": {
+        "server_time": server_time,
+        "uptime": uptime,
+        "cpu": cpu,
+        "mem": mem,
+        "disk": disk,
+        "iface": iface,
+        "rx_bytes": rx_bytes,
+        "tx_bytes": tx_bytes,
+        "hostname": getattr(collector, "hostname", "") if collector else "",
+        "rx_rate": live["rx_rate"],
+        "tx_rate": live["tx_rate"],
+        "latest_ts": meta["latest_ts"],
+        "sample_count": meta["sample_count"],
+        "db_bytes": storage.db_size() if storage is not None else 0,
+    }}
+
+
+def handle_monthly(cfg, storage, collector, iface):
+    """/api/traffic/monthly：固定 12 项升序，末项当月。"""
+    months = storage.monthly(iface) if storage is not None else []
+    return 200, {"ok": True, "data": {"iface": iface, "months": months}}
+
+
+def handle_daily(cfg, storage, collector, iface, month):
+    """/api/traffic/daily：month 非法 → 400（错误体与 Flask 版逐字一致）。"""
+    if not security_mod.valid_month(month):
+        return 400, {"ok": False, "error": "invalid month, expect YYYY-MM"}
     try:
-        v = int(raw)
-    except (TypeError, ValueError):
-        return default
-    if v < lo or (hi is not None and v > hi):
-        return default
-    return v
+        days = storage.daily(iface, month) if storage is not None else []
+    except ValueError:                       # 防御：storage 解析兜底
+        return 400, {"ok": False, "error": "invalid month, expect YYYY-MM"}
+    return 200, {"ok": True, "data": {"month": month, "iface": iface, "days": days}}
 
 
-def _ok(data):
-    return jsonify({"ok": True, "data": data})
+def handle_live(cfg, storage, collector, iface, minutes_raw=None):
+    """/api/traffic/live：速率 + 时间窗序列；minutes 越界/非法回退 30。"""
+    minutes = security_mod.clamp_int(minutes_raw, 30, 5, 1440)
+    d = storage.live(iface, minutes) if storage is not None \
+        else {"rx_rate": 0.0, "tx_rate": 0.0, "series": []}
+    latest = None
+    if storage is not None:
+        latest = storage.status_meta(iface)["latest_ts"]
+    return 200, {"ok": True, "data": {
+        "iface": iface,
+        "rx_rate": d["rx_rate"],
+        "tx_rate": d["tx_rate"],
+        "stale_sec": (int(time.time()) - latest) if latest is not None else None,
+        "series": d["series"],
+    }}
 
 
-def _err(msg, code=400):
-    return jsonify({"ok": False, "error": msg}), code
+def handle_history(cfg, storage, collector, iface, limit_raw=None):
+    """/api/history：最近 limit 条明细（倒序）；limit 越界/非法回退 100。"""
+    limit = security_mod.clamp_int(limit_raw, 100, 1, 1000)
+    samples = storage.history(iface, limit) if storage is not None else []
+    for s in samples:                     # 展示辅助字段（本地时区，SPEC §6.0）
+        s["time"] = datetime.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+    return 200, {"ok": True, "data": {"iface": iface, "samples": samples}}
+
+
+def handle_interfaces(cfg, storage, collector):
+    """/api/interfaces：实时网卡（过滤 lo/虚拟前缀）→ 后端不可用时库内兜底。"""
+    # selected 未确定（空库/后端缺失/首轮采样前）时规范为 ""（SPEC §6.7 字段为字符串）
+    selected = (getattr(collector, "selected", "") or "") if collector is not None else ""
+    result = []
+    backend = procmetrics_mod.metrics_backend(psutil_mod=psutil)
+    if backend is not None:
+        try:
+            counters = backend.net_counters()
+            for name in sorted(counters, key=lambda n: -(
+                    procmetrics_mod.io_bytes(counters[n], "bytes_recv", "rx_bytes")
+                    + procmetrics_mod.io_bytes(counters[n], "bytes_sent", "tx_bytes"))):
+                if name == "lo" or name.startswith(_VIRT_PREFIXES):
+                    continue
+                io = counters[name]
+                result.append({
+                    "name": name,
+                    "rx_bytes": procmetrics_mod.io_bytes(io, "bytes_recv", "rx_bytes"),
+                    "tx_bytes": procmetrics_mod.io_bytes(io, "bytes_sent", "tx_bytes"),
+                    "is_selected": name == selected,
+                })
+        except Exception:
+            log.warning("interfaces: net_io_counters 失败", exc_info=True)
+    if not result and storage is not None:   # 后端不可用 → 库内已知网卡兜底
+        for r in storage.list_ifaces_with_counts():
+            result.append({"name": r["iface"], "rx_bytes": r["rx_bytes"],
+                           "tx_bytes": r["tx_bytes"],
+                           "is_selected": r["iface"] == selected})
+    return 200, {"ok": True, "data": {"selected": selected, "interfaces": result}}
+
+
+# ---------------------------------------------------------------- Flask 适配层
+# SPEC §13.2.2：蓝图 = 薄适配层（request → security 安全门 → 纯处理器 → jsonify）。
+
+def _require_token(view):
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if not security_mod.authenticate(_cfg, request.headers,
+                                         request.args.get("token")):
+            # 统一 401：不区分缺失/错误/参数位置，不泄露任何数据
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def _validate_iface(view):
+    """iface 参数字符集白名单（SECURITY §4.8.4），复用 security.validate_iface。"""
+
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if not security_mod.validate_iface(request.args.get("iface")):
+            return jsonify({"ok": False, "error": "invalid iface"}), 400
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def _params():
+    """当前请求的已解析参数（None = 缺失；与 stdlib parse_qs 首值语义对齐）。"""
+    return {
+        "iface": request.args.get("iface"),
+        "month": request.args.get("month"),
+        "minutes": request.args.get("minutes"),
+        "limit": request.args.get("limit"),
+    }
 
 
 # ---------------------------------------------------------------- 路由
 
 def create_blueprint():
-    """构建 API Blueprint（url_prefix=/api 由 app 注册时指定）。"""
+    """构建 API Blueprint（url_prefix=/api 由 app 注册时指定）。
+
+    SPEC §13.2.2：薄适配层——request → security 安全门（白名单 403 → 限流 429
+    → 视图内鉴权 401 → iface 400）→ 纯处理器 handle_* → jsonify。
+    """
     if not _FLASK:
         raise RuntimeError("Flask 未安装：请先 pip install flask（生产由 requirements.txt 提供）")
     bp = Blueprint("api", __name__)
 
     # ---- 安全中间件（SECURITY §4.3 顺序：白名单 403 → 限流 429 → 视图内鉴权 401）----
-    _rl_lock = threading.Lock()
-    _rl_hits = {}                     # ip -> deque[time.monotonic()]，每 app 实例独立
+    _rl = security_mod.SlidingWindowRateLimiter(security_mod.rate_limit_value(_cfg))
 
     @bp.before_request
     def _security_gate():
-        ip = _client_ip()
-        if not _ip_allowed(ip):
+        ip = security_mod.client_ip(_cfg, request.remote_addr or "", request.headers)
+        if not security_mod.ip_allowed(_cfg, ip):
             return jsonify({"ok": False, "error": "forbidden"}), 403
-        limit = _rate_limit_value()
-        if limit > 0 and not _rate_allowed(ip, limit, _rl_lock, _rl_hits):
+        if not _rl.allow(ip):
             return jsonify({"ok": False, "error": "rate_limited"}), 429
         return None
 
@@ -231,143 +291,52 @@ def create_blueprint():
     @_require_token
     @_validate_iface
     def status():
-        iface = _resolve_iface()
-        server_time = int(time.time())
-        # 实时 psutil（可选：缺失/失败时回退到最新样本与运行态）
-        cpu = mem = disk = uptime = None
-        rx_bytes = tx_bytes = None
-        if psutil is not None:
-            try:
-                cpu = psutil.cpu_percent(interval=None)
-            except Exception:
-                log.warning("status: cpu_percent 失败", exc_info=True)
-            try:
-                vm = psutil.virtual_memory()
-                mem = {"used": vm.used, "total": vm.total}
-            except Exception:
-                log.warning("status: virtual_memory 失败", exc_info=True)
-            try:
-                du = psutil.disk_usage("/")
-                disk = {"used": du.used, "total": du.total}
-            except Exception:
-                log.warning("status: disk_usage 失败", exc_info=True)
-            try:
-                uptime = max(0, int(server_time - psutil.boot_time()))
-            except Exception:
-                log.warning("status: boot_time 失败", exc_info=True)
-            if iface:
-                try:
-                    io = psutil.net_io_counters(pernic=True).get(iface)
-                    if io is not None:
-                        rx_bytes, tx_bytes = io.bytes_recv, io.bytes_sent
-                except Exception:
-                    log.warning("status: net_io_counters 失败", exc_info=True)
-        ls = _storage.latest_sample(iface) if _storage is not None and iface else None
-        if cpu is None:
-            cpu = ls["cpu"] if ls else 0.0
-        if mem is None:
-            mem = {"used": ls["mem_used"], "total": ls["mem_total"]} if ls else {"used": 0, "total": 0}
-        if disk is None:
-            disk = {"used": ls["disk_used"], "total": ls["disk_total"]} if ls else {"used": 0, "total": 0}
-        if uptime is None:
-            uptime = getattr(_collector, "uptime", None) if _collector else None
-        if rx_bytes is None:
-            rx_bytes = ls["rx_bytes"] if ls else None
-            tx_bytes = ls["tx_bytes"] if ls else None
-        meta = _storage.status_meta(iface) if _storage is not None else {"latest_ts": None, "sample_count": 0}
-        live = _storage.live(iface, 5) if _storage is not None else {"rx_rate": 0.0, "tx_rate": 0.0}
-        return _ok({
-            "server_time": server_time,
-            "uptime": uptime,
-            "cpu": cpu,
-            "mem": mem,
-            "disk": disk,
-            "iface": iface,
-            "rx_bytes": rx_bytes,
-            "tx_bytes": tx_bytes,
-            "hostname": getattr(_collector, "hostname", "") if _collector else "",
-            "rx_rate": live["rx_rate"],
-            "tx_rate": live["tx_rate"],
-            "latest_ts": meta["latest_ts"],
-            "sample_count": meta["sample_count"],
-            "db_bytes": _storage.db_size() if _storage is not None else 0,
-        })
+        params = _params()
+        code, body = handle_status(_cfg, _storage, _collector,
+                                   resolve_iface(params, _collector))
+        return jsonify(body), code
 
     @bp.route("/traffic/monthly", methods=["GET"])
     @_require_token
     @_validate_iface
     def monthly():
-        iface = _resolve_iface()
-        months = _storage.monthly(iface) if _storage is not None else []
-        return _ok({"iface": iface, "months": months})
+        params = _params()
+        code, body = handle_monthly(_cfg, _storage, _collector,
+                                    resolve_iface(params, _collector))
+        return jsonify(body), code
 
     @bp.route("/traffic/daily", methods=["GET"])
     @_require_token
     @_validate_iface
     def daily():
-        month = request.args.get("month", "")
-        iface = _resolve_iface()
-        try:
-            days = _storage.daily(iface, month) if _storage is not None else []
-        except ValueError:
-            return _err("invalid month, expect YYYY-MM", 400)
-        return _ok({"month": month, "iface": iface, "days": days})
+        params = _params()
+        code, body = handle_daily(_cfg, _storage, _collector,
+                                  resolve_iface(params, _collector), params["month"])
+        return jsonify(body), code
 
     @bp.route("/traffic/live", methods=["GET"])
     @_require_token
     @_validate_iface
     def live():
-        minutes = _clamp_int(request.args.get("minutes", 30), 30, 5, 1440)
-        iface = _resolve_iface()
-        d = _storage.live(iface, minutes) if _storage is not None else \
-            {"rx_rate": 0.0, "tx_rate": 0.0, "series": []}
-        latest = None
-        if _storage is not None:
-            latest = _storage.status_meta(iface)["latest_ts"]
-        return _ok({
-            "iface": iface,
-            "rx_rate": d["rx_rate"],
-            "tx_rate": d["tx_rate"],
-            "stale_sec": (int(time.time()) - latest) if latest is not None else None,
-            "series": d["series"],
-        })
+        params = _params()
+        code, body = handle_live(_cfg, _storage, _collector,
+                                 resolve_iface(params, _collector), params["minutes"])
+        return jsonify(body), code
 
     @bp.route("/history", methods=["GET"])
     @_require_token
     @_validate_iface
     def history():
-        limit = _clamp_int(request.args.get("limit", 100), 100, 1, 1000)
-        iface = _resolve_iface()
-        samples = _storage.history(iface, limit) if _storage is not None else []
-        for s in samples:                     # 展示辅助字段（本地时区，SPEC §6.0）
-            s["time"] = datetime.fromtimestamp(s["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-        return _ok({"iface": iface, "samples": samples})
+        params = _params()
+        code, body = handle_history(_cfg, _storage, _collector,
+                                    resolve_iface(params, _collector), params["limit"])
+        return jsonify(body), code
 
     @bp.route("/interfaces", methods=["GET"])
     @_require_token
     def interfaces():
-        # selected 未确定（空库/psutil 缺失/首轮采样前）时规范为 ""（SPEC §6.7 字段为字符串）
-        selected = (getattr(_collector, "selected", "") or "") if _collector is not None else ""
-        result = []
-        if psutil is not None:
-            try:
-                counters = psutil.net_io_counters(pernic=True)
-                for name in sorted(counters,
-                                   key=lambda n: -(counters[n].bytes_recv + counters[n].bytes_sent)):
-                    if name == "lo" or name.startswith(_VIRT_PREFIXES):
-                        continue
-                    io = counters[name]
-                    result.append({"name": name, "rx_bytes": io.bytes_recv,
-                                   "tx_bytes": io.bytes_sent,
-                                   "is_selected": name == selected})
-            except Exception:
-                log.warning("interfaces: net_io_counters 失败", exc_info=True)
-        if not result and _storage is not None:   # psutil 缺失 → 库内已知网卡兜底
-            for r in _storage.list_ifaces_with_counts():
-                result.append({"name": r["iface"], "rx_bytes": r["rx_bytes"],
-                               "tx_bytes": r["tx_bytes"],
-                               "is_selected": r["iface"] == selected})
-        return _ok({"selected": selected, "interfaces": result})
+        code, body = handle_interfaces(_cfg, _storage, _collector)
+        return jsonify(body), code
 
     return bp
 

@@ -14,8 +14,9 @@
 hostname/boot_time/uptime 不落库（samples 表无对应列，SPEC §5 口径），以运行态
 属性暴露，供 api.py /api/status 读取（该端点本就实时读 psutil，见 SPEC §6.2）。
 
-本模块不依赖 Flask；psutil 缺失时采样不可用但模块可导入，网卡选择纯函数与
-自检仍可运行。自检：python -m vpsmon.collector --self-test
+本模块不依赖 Flask；psutil 缺失时自动切换 /proc 采集后端（procmetrics，
+OpenWrt 纯标准库路径，SPEC §13.2.1），网卡选择纯函数与自检仍可运行。
+自检：python -m vpsmon.collector --self-test
 """
 
 import logging
@@ -29,6 +30,8 @@ try:
     import psutil
 except ImportError:                      # 开发/自检环境可无 psutil；生产由 requirements.txt 保证
     psutil = None                        # type: ignore[assignment]
+
+from vpsmon import procmetrics as procmetrics_mod
 
 log = logging.getLogger("vpsmon.collector")
 
@@ -51,7 +54,9 @@ def select_iface(counters: Dict, prefer: Optional[str] = None) -> Optional[str]:
 
     def total(name):
         io = counters[name]
-        return int(getattr(io, "bytes_recv", 0)) + int(getattr(io, "bytes_sent", 0))
+        # SPEC §13.2.1：归一化两种计数视图（psutil 属性 / procmetrics dict）
+        return (procmetrics_mod.io_bytes(io, "bytes_recv", "rx_bytes")
+                + procmetrics_mod.io_bytes(io, "bytes_sent", "tx_bytes"))
 
     def valid(name):
         return (name != "lo"
@@ -123,13 +128,17 @@ class Collector:
 
     def sample_once(self) -> None:
         """执行一轮采样并写库。核心项（网卡计数）失败则整轮放弃；可选指标单点
-        失败记录日志并回退到上一轮值，不影响本轮与后续轮次。"""
-        if psutil is None:
-            log.error("psutil 未安装，无法采样（生产环境请 pip install psutil）")
+        失败记录日志并回退到上一轮值，不影响本轮与后续轮次。
+
+        采集后端（SPEC §13.2.1）：psutil 可用 → psutil；否则自动走 /proc
+        （procmetrics，OpenWrt 路径）。两后端返回同形状数据。"""
+        backend = procmetrics_mod.metrics_backend(psutil_mod=psutil)
+        if backend is None:
+            log.error("无可用采集后端（psutil 与 /proc 均不可用）")
             return
         # 1) 网卡累计计数（核心，失败则整轮放弃）
         try:
-            counters = psutil.net_io_counters(pernic=True)
+            counters = backend.net_counters()
         except Exception:
             log.exception("net_io_counters 失败，跳过本轮")
             return
@@ -145,25 +154,27 @@ class Collector:
                 log.info("选定统计网卡: %s", iface)
             self.selected = iface
         io = counters[iface]
-        rx_bytes = int(getattr(io, "bytes_recv", 0))
-        tx_bytes = int(getattr(io, "bytes_sent", 0))
+        rx_bytes = procmetrics_mod.io_bytes(io, "bytes_recv", "rx_bytes")
+        tx_bytes = procmetrics_mod.io_bytes(io, "bytes_sent", "tx_bytes")
 
         # 2) 可选指标（单点失败 → 记录 + 回退上一轮值）
+        def _mem_pair():
+            m = backend.meminfo()
+            return (int(m["used"]), int(m["total"]))
+
+        def _disk_pair():
+            d = backend.disk_usage("/")
+            return (int(d["used"]), int(d["total"]))
+
         cpu = self._safe_metric("cpu_percent",
-                                lambda: psutil.cpu_percent(interval=None),
+                                lambda: backend.cpu_percent(),
                                 self._prev_cpu)
         self._prev_cpu = cpu
-        mem = self._safe_metric("virtual_memory",
-                                lambda: (psutil.virtual_memory().used,
-                                         psutil.virtual_memory().total),
-                                self._prev_mem)
+        mem = self._safe_metric("virtual_memory", _mem_pair, self._prev_mem)
         self._prev_mem = mem
-        disk = self._safe_metric("disk_usage",
-                                 lambda: (psutil.disk_usage("/").used,
-                                          psutil.disk_usage("/").total),
-                                 self._prev_disk)
+        disk = self._safe_metric("disk_usage", _disk_pair, self._prev_disk)
         self._prev_disk = disk
-        boot = self._safe_metric("boot_time", lambda: psutil.boot_time(),
+        boot = self._safe_metric("boot_time", lambda: backend.boot_time(),
                                  self.boot_time)
         if boot is not None:
             self.boot_time = boot

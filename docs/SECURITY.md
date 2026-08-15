@@ -1,10 +1,10 @@
 # VPS 流量统计监控系统 — 安全审计与加固方案（SECURITY）
 
-- 版本：1.0
-- 审计人：sec_researcher（安全审计专家，任务 t1）
-- 审计日期：2025（项目即将托管 GitHub 公网部署前）
-- 审计对象：`install.sh`、`uninstall.sh`、`vpsmon.service`、`vpsmon/{app,api,config,collector,storage}.py`、`vpsmon/static/*`、`README.md`、`docs/SPEC.md`、`requirements.txt`
-- 用途：本文档是 T2（后端加固）/ T3（安装加固）的实施依据；"必须做"清单见 §5。
+- 版本：1.1（T8 新增 §4.12"OpenWrt 部署安全"与 §9"T8 安全复审记录"；1.0 为 t1 审计版本）
+- 审计人：sec_researcher（安全审计专家，任务 t1）；T8 复审：ow_researcher（架构师）
+- 审计日期：2025（项目即将托管 GitHub 公网部署前）；T8 复审：2026-08（OpenWrt 支持 + 标准库双后端交付后）
+- 审计对象：`install.sh`、`uninstall.sh`、`vpsmon.service`、`vpsmon/{app,api,config,collector,storage,procmetrics,security,stdserver}.py`、`vpsmon/static/*`、`README.md`、`docs/SPEC.md`、`requirements.txt`、`.gitignore`
+- 用途：本文档是 T2（后端加固）/ T3（安装加固）/ T4（标准库双后端）/ T5（OpenWrt 安装分支）的实施依据；"必须做"清单见 §5；T8 复审结论见 §9。
 
 ---
 
@@ -314,7 +314,51 @@ Environment=PYTHONDONTWRITEBYTECODE=1   # strict 下 /opt/vpsmon 只读，禁止
    - 推荐 pin commit：`https://raw.githubusercontent.com/<owner>/<repo>/<commit-sha>/install.sh`；
    - 支持 `VPSMON_EXPECTED_SHA256=<发布方公布的 tarball 校验和>`：`fetch_remote_source` 下载后先 `sha256sum -c` 比对，不匹配立即退出（提示供应链风险）。
 3. **前端 CDN 兜底删除（M4）**：`app.js:543-559` 的 CDN 回退分支移除（`static/vendor/echarts.min.js` 1.0MB 已随包部署，删除兜底消除第三方脚本执行面，同时使 `script-src 'self'` CSP 严格成立）。
-4. **`.gitignore` 复核**：config.json/*.db 已忽略；确认密钥证书（cert.pem/key.pem）、`.firewall-rule` 不进仓库（补充规则）。
+4. **`.gitignore` 复核**：config.json/*.db 已忽略；确认密钥证书（cert.pem/key.pem）、`.firewall-rule` 不进仓库（补充规则）；T8 复核补强：全部自检残留目录（`vpsmon_*_test_*/`）、`.piptmp/`、`.devtest/`、`.agent-teams/` 均不入库。
+
+### 4.12 OpenWrt 部署安全（T5 安装分支 + T8 复审）
+
+OpenWrt 形态与 VPS/systemd 形态的安全基线**等价**（鉴权/限流/白名单/安全头/Host/日志脱敏，Flask 与 stdlib 双后端逐条一致，见 docs/SPEC.md §13.2），差异在部署面：
+
+1. **服务以 root 运行，无降权**（OpenWrt procd 惯例，无 vpsmon 系统用户；SPEC §13.5-4）：HTTP 服务被攻破即获得 root。缓解（安装默认 + 文档指引）：
+   - token 安装时**强制默认生成**（与 VPS 形态一致）；
+   - **建议 `bind` 收紧**：`config.json` 设 `"bind": "127.0.0.1"`（纯本机）或路由器 LAN IP（如 `"bind": "192.168.1.1"`），改后 `/etc/init.d/vpsmon restart`；
+   - **建议 `allow_ips` 白名单**：如 `"allow_ips": ["192.168.1.0/24"]`（应用层 403 兜底，忘记 token 也不裸奔）；
+   - uci 防火墙默认**只放行 lan 来源**（install.sh 交互放行 `src='lan'`），**不建议 wan 直接放行**；
+   - WAN 访问必须走反向代理（nginx/HAProxy + TLS，opkg 可装）或自签证书（`opkg install openssl-util` 后按 §4.5 生成），**禁止公网明文 HTTP 暴露**。
+
+   推荐配置示例（`/etc/vpsmon/config.json`，权限 600）：
+   ```json
+   {
+     "port": 9090,
+     "interval": 60,
+     "token": "<安装时自动生成，勿外传>",
+     "bind": "192.168.1.1",
+     "allow_ips": ["192.168.1.0/24"],
+     "rate_limit": 60
+   }
+   ```
+   防火墙（仅 lan 来源）：
+   ```
+   uci add firewall rule
+   uci set firewall.@rule[-1].name='vpsmon'
+   uci set firewall.@rule[-1].src='lan'
+   uci set firewall.@rule[-1].proto='tcp'
+   uci set firewall.@rule[-1].dest_port='9090'
+   uci set firewall.@rule[-1].target='ACCEPT'
+   uci commit firewall
+   /etc/init.d/firewall reload
+   ```
+
+2. **数据/配置在 overlay 的 `/etc/vpsmon`**（`/var`、`/tmp` 为 tmpfs 重启清空，必须 overlay）：目录 700、`config.json` 600（`umask 077` 子 shell 写入，M6 同款）；token 明文存储与 VPS 形态同等接受（root 可见属运维必然）。`PROBE_PATHS` 顺序 `/var/lib/vpsmon` → `/etc/vpsmon` → `./`。
+
+3. **无 systemd 加固指令**（procd 无 ProtectSystem/UMask 等）：以权限（程序目录 root:root 755、数据目录 700/config 600）+ 防火墙 + token/白名单补偿；init 脚本设 `PYTHONDONTWRITEBYTECODE=1`（/opt 只读，防写 `__pycache__`）。
+
+4. **日志经 logd**：`logread | grep vpsmon`；stdlib 服务器 access log 查询串脱敏（`?token=` → `?redacted`，stdserver.log_message）与 werkzeug 版（M5）同语义，token 不出日志。
+
+5. **双后端行为差异（T8 实测，无安全弱化，stdlib 刻意更严）**：对"非 GET 命中已知 API 端点"且被白名单/限流排除的请求，stdlib 后端先执行白名单/限流门再应答（403/429），Flask 由路由层直接 405（before_request 不执行）。两后端均拒绝；stdlib 更贴合 §4.3"白名单优先"语义。未知路径的 404 顺序两后端一致（均先于安全门）。已由 stdserver 自检断言锁定（T8 新增）。
+
+6. **发布面（T8 复核）**：`.gitignore` 覆盖 `config.json`/`*.db`/`*.pem`/`*.key`/`.firewall-rule`/`.piptmp/`/`.devtest/`/`.agent-teams/` 与全部自检残留目录；源码无硬编码密钥；README token 示例一律占位符。
 
 ---
 
@@ -408,3 +452,68 @@ journalctl -u vpsmon | grep -E '\?token='   # 应无输出
 #    管道模式（stdin 非终端）不带 --port → 报错退出；带 --port 正常安装；
 #    交互模式输入非法端口 → 重试；token 自动生成并打印
 ```
+
+---
+
+## 9. T8 安全复审记录（OpenWrt 支持 + 标准库双后端 + 发布面）
+
+- 复审人：ow_researcher（架构师，任务 t8）
+- 复审对象：T4（`procmetrics.py`/`security.py`/`stdserver.py`/api 纯处理器/app 双后端）、T5（install.sh/uninstall.sh OpenWrt 分支：opkg/procd/uci）、T7（systemd 单元分档与行尾注释修复）、发布面（.gitignore/README/密钥）
+- 方法：全量源码审阅 + 实测回归。无 flask/psutil 环境（本机 Python 3.12 无此二包）= OpenWrt stdlib 模拟；`.piptmp/vendor` 提供 Flask 3.1.3 跑 Flask 路径；`python vpsmon/app.py` 直接脚本执行验证 sys.path 兼容层；`.devtest/t8_probe.py` 双后端门序对比探针。
+- 结论：**未发现可利用漏洞（无高危/中危）**；1 项低危行为差异（已文档化，stdlib 刻意更严，§4.12-5）；1 项发布面缺口（已修复）；T7 修复复核通过。
+
+### 9.1 回归实测结果
+
+| 套件 | 命令 | 结果 |
+|---|---|---|
+| storage 自检 | `python -m vpsmon.storage` | ✅ 全过 |
+| config 自检 | `python -m vpsmon.config` | ✅ 26/26 |
+| collector 自检（psutil 缺失 → /proc 后端路径）| `python -m vpsmon.collector --self-test` | ✅ 20/20 |
+| procmetrics 自检 | `python -m vpsmon.procmetrics --self-test` | ✅ 22/22 |
+| security 自检 | `python -m vpsmon.security --self-test` | ✅ 47/47 |
+| stdserver 自检（stdlib 后端 + 双后端契约对比，T8 新增 1 项）| `python -m vpsmon.stdserver --self-test` | ✅ 38/38 |
+| api 冒烟（Flask，无回归）| `python -m vpsmon.api`（PYTHONPATH=.piptmp/vendor）| ✅ 55/55 |
+| app 端到端（Flask，无回归）| `python -m vpsmon.app --selftest` | ✅ 51/51 |
+| app 直接脚本执行（stdlib 链）| `python vpsmon/app.py --selftest` | ✅ procmetrics/security/stdserver 全过 |
+| 门序探针（白名单 vs 404/405）| `.devtest/t8_probe.py` | ✅ 见 §4.12-5 |
+
+### 9.2 修复项（T8 直接修复）
+
+1. **`.gitignore` 残留目录缺口**：`vpsmon_x_*/` 无法匹配 `vpsmon_proc_test_*`/`vpsmon_http_test_*`/`vpsmon_config_test_*`/`vpsmon_app_test_*` 等自检残留目录（自检异常退出时可能残留并被提交）。修复：改为 `vpsmon_*_test_*/`。
+2. **stdlib 门序断言锁定**：stdserver 自检新增"白名单外 POST 已知端点 → 403（先于 405）"断言，锁定 §4.12-5 的白名单优先语义，防后续回归。
+
+### 9.3 复核通过项（T7 修复确认）
+
+- ✅ `vpsmon.service` 参考模板与 install.sh 生成的单元**值行均无行尾注释**（行首 `#` 注释行除外）；install.sh selftest 含行尾注释守卫（`install.sh` 自检段：生成单元与模板值行含 `#`/`;` 即 FAIL），防止回归。
+- ✅ T2 三档门限正确：通用档（≥219）/ UMask（≥229）/ 内核与资源（≥230）/ seccomp（≥231）/ namespaces（≥233）/ 完整档（≥244）；selftest 对 219/228/229/230/231/233/244/254 各版本断言"版本不足的指令绝不出现在单元里"（assert_not_contains 全覆盖）。
+- ✅ `ExecStart=/opt/vpsmon/venv/bin/python -m vpsmon.app --config /var/lib/vpsmon/config.json`（`-m` 模式，WorkingDirectory=/opt/vpsmon 保证包可见；与 app.py 直接执行兼容层互备）。
+- ⚠️ install.sh `--selftest` 需 bash，本机（Windows）无法执行；已静态复核断言逻辑（install.sh:930-1114），建议 reviewer 在 Linux 实测终验。
+
+### 9.4 OpenWrt 新增面复核结论
+
+| 项 | 结论 |
+|---|---|
+| stdserver `/static` realpath 前缀防穿越 | ✅ `_serve_static` realpath + `startswith(root+sep)`；实测 `/static/../vpsmon/app.py`、`/static/../../requirements.txt` → 404；URL 编码（%2e%2e）不解码落为不存在文件名 → 404 |
+| Host 校验（全请求）| ✅ `_dispatch`/`_not_get` 均先 `valid_host`（400 invalid host），与 Flask before_request 一致 |
+| 安全门顺序 403→429→401→400 | ✅ `_api_gate` 与 Flask 逐条一致；非 GET 已知端点先过白名单/限流（§4.12-5，刻意更严）|
+| 限流/白名单与 Flask 一致性 | ✅ 同源 security.py 原语；行为差异仅限非 GET 已知端点（见上）|
+| TLS fail-closed | ✅ stdlib 路径证书缺失 → `create_server` 抛 ValueError → app.py 退出 1（selftest 断言）|
+| 日志脱敏 | ✅ stdserver.log_message 覆写 + `vpsmon.http` logger；实测 `?token=sekrit` 不出日志 |
+| procmetrics.py 注入面 | ✅ 纯文件解析，无命令执行/无拼接；字段缺失/非数字防御为 0；proc_dir 注入仅测试用 |
+| procd init 脚本 | ✅ command/参数经 `procd_append_param` 逐项传递（无 shell 拼接注入面）；respawn 3600 5 5；stdout/stderr 送 logd；`PYTHONDONTWRITEBYTECODE=1` |
+| uci 防火墙 | ✅ 段名由 `uci add` 返回（uciname 字符集），set/delete 均带引号；撤销双保险（段存在 + name=vpsmon 才删）；标记 600；注入面需 root 写 /etc/vpsmon（700）才存在，无提级 |
+| /etc/vpsmon 权限与 PROBE_PATHS | ✅ write_config：umask 077 + chmod 600 config + chmod 700 目录；PROBE_PATHS `/var/lib` → `/etc/vpsmon` → `./` |
+| OpenWrt root 无降权暴露面 | ✅ 已文档化（§4.12-1）：bind 127.0.0.1/LAN + allow_ips + uci src=lan + 反代/TLS 指引，含配置示例 |
+
+### 9.5 发布面复核结论
+
+- ✅ `.gitignore`：config.json/*.db/*.pem/*.key/.firewall-rule/.piptmp/.devtest/.agent-teams + `vpsmon_*_test_*/`（T8 修复后全覆盖）。
+- ✅ README token 示例：`X-Token: <token>`、`"token": ""`、`--token "MyToken123"` 均为占位符；无真实密钥。
+- ✅ 源码无硬编码密钥（grep 长 base64/hex 串无命中）；install.sh/uninstall.sh 无泄露路径（token 仅 config.json 600 + 安装终端打印，属设计）。
+- ✅ 前端无 CDN 兜底（M4）：`static/js/app.js` 无 cdn/jsdelivr 引用；token 存 localStorage 已文档化（XSS 风险由 CSP `script-src 'self'` 兜底）。
+
+### 9.6 接受项（文档化，不修复）
+
+1. OpenWrt root 运行无降权：以 token 强制生成 + bind 收紧 + allow_ips + uci src=lan 补偿（§4.12-1）；后续可选 `procd_set_param user` 降权（本期不做，SPEC §13.5-4）。
+2. 非 GET 已知端点门序差异：stdlib 更严（403/429 先于 405），双后端均拒绝，无信息面扩大（§4.12-5）。
+3. 内存限流重启清零、token 明文存 config.json、自签 TLS 告警、curl|bash 供应链信任：沿用 §7 既有接受项，OpenWrt 形态同等适用。

@@ -15,6 +15,7 @@
 """
 
 import calendar
+import logging
 import os
 import re
 import sqlite3
@@ -22,6 +23,8 @@ import threading
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+
+log = logging.getLogger("vpsmon.storage")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
@@ -108,9 +111,21 @@ class Storage:
     # ------------------------------------------------------------------ 写
 
     def init_db(self) -> None:
-        """建表 / WAL / 索引（幂等，可重复调用）。"""
+        """建表 / WAL / 索引（幂等，可重复调用）。
+
+        SPEC §13.5-5：WAL 在部分文件系统（如 OpenWrt overlay jffs2/ubifs）上
+        可能不可用，PRAGMA journal_mode=WAL 失败时自动回退 DELETE（不新增配置项）。
+        """
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode = WAL")
+            try:
+                self._conn.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.Error:
+                log.warning("WAL 模式不可用，回退 journal_mode=DELETE"
+                            "（OpenWrt overlay 文件系统常见）")
+                try:
+                    self._conn.execute("PRAGMA journal_mode = DELETE")
+                except sqlite3.Error:
+                    pass
             self._conn.execute("PRAGMA synchronous = NORMAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute(SCHEMA)

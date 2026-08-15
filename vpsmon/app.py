@@ -1,49 +1,69 @@
 # -*- coding: utf-8 -*-
-"""vpsmon.app — 入口：配置 → 存储 → 采集线程 → Flask（SPEC §3 / §7 + SECURITY §4 加固）。
+"""vpsmon.app — 入口：配置 → 存储 → 采集线程 → Web 服务（Flask / 纯标准库双后端）。
+
+SPEC §3 / §7 + §13.2.4：启动时探测 Flask——
+  可用 → Flask 路径（create_app + app.run，行为零变化）；
+  不可用 → stdlib 服务器（stdserver.create_server，OpenWrt 纯标准库路径）。
+两后端共用同一套 config/Storage/Collector/api 纯处理器/security 安全原语，
+6 端点 API 契约逐字段一致（SPEC §13.2.2/§13.6 验收 2）。
 
 用法：python -m vpsmon.app [--config <path>] [--db <path>] [--port <n>]
                           [--interval <n>] [--selftest]
+      也支持直接执行脚本：python vpsmon/app.py ...（等价，见下方导入兼容说明）
 
 - --config 优先级最高，其次 VPSMON_CONFIG 环境变量，再探测 /var/lib/vpsmon/config.json
   与 ./config.json，最后内置默认（config.load_config，SPEC §4.2）；
 - 数据库默认位于配置文件同目录 vpsmon.db，--db 显式覆盖（SPEC §3）；
-- 初始化 Storage → 启动 Collector（daemon 线程，唯一写库者）→ 注册 API Blueprint
-  （url_prefix=/api）→ 静态页 / 与 /static/* → 按 cfg["bind"] 监听；
-- TLS：cfg 中 ssl_certfile+ssl_keyfile 均配置且文件存在时启用
-  app.run(ssl_context=(cert, key))；证书缺失则拒绝启动（不静默降级明文）；
-- 安全加固（SECURITY.md §4.6/§4.7/§4.8）：
-  * after_request 全量注入安全响应头（CSP/X-Frame-Options/nosniff/
-    Referrer-Policy/Permissions-Policy/Cache-Control，API 强制 no-store）；
-  * before_request Host 头校验（结构合法 + 主机名钉扎，防 DNS rebinding）；
+- 初始化 Storage → 启动 Collector（daemon 线程，唯一写库者）→ 装配 API
+  （Flask 蓝图或 stdlib 路由）→ 静态页 / 与 /static/* → 按 cfg["bind"] 监听；
+- TLS：cfg 中 ssl_certfile+ssl_keyfile 均配置且文件存在时启用（Flask
+  ssl_context / stdlib ssl 包裹 socket）；证书缺失则拒绝启动（不静默降级明文）；
+- 安全加固（SECURITY.md §4.6/§4.7/§4.8，原语集中在 security.py）：
+  * 全量安全响应头（CSP/X-Frame-Options/nosniff/Referrer-Policy/
+    Permissions-Policy/Cache-Control，API 强制 no-store；HTTPS 追加 HSTS）；
+  * Host 头校验（结构合法 + 主机名钉扎，防 DNS rebinding）；
   * werkzeug access log 查询串脱敏（query string → ?redacted，防 ?token= 入日志）；
   * debug 强制 False（配置 true 也会被 config.load_config 回退）；
-- --selftest：装配临时库跑端到端安全断言后退出（不启动监听）。
+- --selftest：Flask 可用 → 现有端到端安全断言；不可用 → 依次跑
+  procmetrics/security/stdserver 三个 stdlib 自检（含 stdlib 安全断言）后退出。
 """
 
 import argparse
-import ipaddress
 import logging
 import os
 import re
-import socket
 import sys
 import time
-from urllib.parse import urlsplit
 
-from . import api as api_mod
-from . import collector as collector_mod
-from . import config as config_mod
-from . import storage as storage_mod
+# ---- 直接脚本执行兼容（NAS/systemd 以 `python vpsmon/app.py` 方式运行）----
+# 以 -m 运行（python -m vpsmon.app）时 __package__ == "vpsmon"，包内相对导入可用；
+# 直接执行脚本时 __package__ 为空，`from . import ...` 必然 ImportError。
+# 这里在直接模式下先把项目根目录（app.py 的父目录）插入 sys.path 最前，
+# 并统一改用绝对导入（from vpsmon import ...）——两种运行方式语义一致；
+# 包内其他模块（api.py 等）的相对导入不受影响：绝对导入以 vpsmon.* 名义加载时
+# 其 __package__ 为 "vpsmon"，包内相对导入照常解析。
+if __package__ in (None, ""):
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+
+from vpsmon import api as api_mod
+from vpsmon import collector as collector_mod
+from vpsmon import config as config_mod
+from vpsmon import security as security_mod
+from vpsmon import stdserver as stdserver_mod
+from vpsmon import storage as storage_mod
 
 log = logging.getLogger("vpsmon.app")
 
-# SECURITY §4.6 工作值（已在现有前端验证可工作：无内联 script、
-# 内联 style 属性 + ECharts 动态样式需 'unsafe-inline'、data: favicon 需 img-src data:）
-_CSP = (
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
-    "object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-)
+
+def _has_flask() -> bool:
+    """SPEC §13.2.4：启动时探测一次 Flask（stdlib 路径 import 期不触碰 flask）。"""
+    try:
+        import flask  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def _parse_args(argv=None):
@@ -90,46 +110,11 @@ def _install_redact_filter() -> None:
     logger.addFilter(_QueryRedactFilter())
 
 
-def _valid_host(host_header: str, bind: str) -> bool:
-    """Host 头校验（SECURITY §4.8，防 Host 投毒/DNS rebinding）。
-
-    - 缺失/结构非法（含 / \\ 空白 控制字符 @、解析失败）→ False；
-    - 端口必须为空或 1-65535（非法端口 → urlsplit.port 抛 ValueError → False）；
-    - IP 字面量（IPv4/IPv6）直接放行：IP 不参与 DNS 解析，无 rebinding 面；
-    - 主机名必须 ∈ {bind, 127.0.0.1, localhost, ::1, 本机 hostname}，
-      攻击者控制的任意域名无法通过校验。
-    注：反代部署若透传域名，需将域名配置到 bind 或改为 IP 访问。
-    """
-    if not host_header or any(c in host_header for c in "/\\\x00\r\n @"):
-        return False
-    try:
-        parsed = urlsplit("//" + host_header)
-        hostname = parsed.hostname
-        _port = parsed.port            # 越界/非数字端口 → ValueError
-    except ValueError:
-        return False
-    if not hostname:
-        return False
-    hostname = hostname.strip().rstrip(".").lower()
-    if not hostname:
-        return False
-    try:
-        ipaddress.ip_address(hostname)
-        return True
-    except ValueError:
-        pass
-    allowed = {str(bind or "").strip().lower(), "127.0.0.1", "localhost", "::1"}
-    try:
-        allowed.add(socket.gethostname().lower())
-    except Exception:
-        pass
-    return hostname in allowed
-
-
 def create_app(cfg, storage, collector):
     """组装 Flask app（api 蓝图 + 错误处理 + 安全响应头 + Host 校验 + 静态页）。
 
-    供测试与 main 复用。安全钩子对所有请求生效：
+    供测试与 main 复用。安全钩子对所有请求生效（原语来自 security.py，
+    SPEC §13.2.2，与 stdlib 后端行为一致）：
     - before_request：Host 头校验（非法 → 400 JSON）；
     - after_request：安全响应头全量注入（API 强制 no-store，静态页放宽缓存）。
     """
@@ -152,28 +137,14 @@ def create_app(cfg, storage, collector):
 
     @app.before_request
     def _guard_host():
-        if not _valid_host(request.headers.get("Host", ""), cfg.get("bind", "")):
+        if not security_mod.valid_host(request.headers.get("Host", ""), cfg.get("bind", "")):
             return jsonify({"ok": False, "error": "invalid host"}), 400
         return None
 
     @app.after_request
     def _security_headers(resp):
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["X-Frame-Options"] = "DENY"
-        resp.headers["Referrer-Policy"] = "no-referrer"
-        resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
-        resp.headers["Content-Security-Policy"] = _CSP
-        path = request.path
-        if path.startswith("/api/"):
-            resp.headers["Cache-Control"] = "no-store"
-        elif path.startswith("/static/"):
-            resp.headers["Cache-Control"] = "public, max-age=3600"
-        elif path == "/":
-            resp.headers["Cache-Control"] = "public, max-age=300"
-        else:
-            resp.headers["Cache-Control"] = "no-store"
-        if request.is_secure:                 # 仅 HTTPS 下发 HSTS
-            resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        for k, v in security_mod.security_headers(request.path, request.is_secure).items():
+            resp.headers[k] = v
         return resp
 
     @app.errorhandler(404)
@@ -197,7 +168,9 @@ def main(argv=None) -> int:
     _setup_logging()
     _install_redact_filter()
     if args.selftest:
-        return _self_test()
+        if _has_flask():
+            return _self_test()
+        return _stdlib_self_test()
 
     cfg = config_mod.load_config(args.config)
     config_mod.apply_overrides(cfg, port=args.port, interval=args.interval, db_path=args.db)
@@ -225,18 +198,53 @@ def main(argv=None) -> int:
     collector.start()
     api_mod.configure(cfg, storage, collector)
 
-    app = create_app(cfg, storage, collector)
+    # SPEC §13.2.4：后端自动选择（仅启动时判定一次）
+    if _has_flask():
+        app = create_app(cfg, storage, collector)
+        try:
+            log.info("vpsmon (flask) listening on %s://%s:%d (iface=%s)",
+                     scheme, cfg["bind"], cfg["port"], collector.selected or "(auto)")
+            app.run(host=cfg["bind"], port=cfg["port"], ssl_context=ssl_ctx,
+                    debug=False, use_reloader=False)
+        except KeyboardInterrupt:
+            log.info("收到中断，正在退出…")
+        finally:
+            collector.stop()
+            storage.close()
+            log.info("vpsmon 已退出")
+        return 0
+
+    # stdlib 后端（OpenWrt 路径，纯标准库）
     try:
-        log.info("vpsmon listening on %s://%s:%d (iface=%s)",
+        server = stdserver_mod.create_server(cfg, storage, collector, tls=ssl_ctx)
+    except ValueError as e:
+        log.error("%s", e)
+        collector.stop()
+        storage.close()
+        return 1
+    try:
+        log.info("vpsmon (stdlib) listening on %s://%s:%d (iface=%s)",
                  scheme, cfg["bind"], cfg["port"], collector.selected or "(auto)")
-        app.run(host=cfg["bind"], port=cfg["port"], ssl_context=ssl_ctx,
-                debug=False, use_reloader=False)
+        server.serve_forever()
     except KeyboardInterrupt:
         log.info("收到中断，正在退出…")
     finally:
+        server.server_close()
         collector.stop()
         storage.close()
         log.info("vpsmon 已退出")
+    return 0
+
+
+def _stdlib_self_test() -> int:
+    """SPEC §13.6 验收 1：无 flask/psutil 环境下的 stdlib 自检链。"""
+    import vpsmon.procmetrics as procmetrics_mod
+    import vpsmon.security as security_mod
+    import vpsmon.stdserver as stdserver_mod
+    for fn in (procmetrics_mod._self_test, security_mod._self_test,
+               stdserver_mod._self_test):
+        fn()
+    print("\nstdlib self-test: all passed")
     return 0
 
 
