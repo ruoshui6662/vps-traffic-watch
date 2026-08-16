@@ -14,6 +14,8 @@ SPEC §13.2.2：从 api.py/app.py 提取，安全行为逐条对齐 SECURITY.md 
                                          ?token= 兼容；失败统一 401（由调用方应答）
     security_headers(path, is_secure)     安全响应头全量（CSP/XFO/nosniff/Referrer/
                                          Permissions/Cache-Control；is_secure 追加 HSTS）
+    ensure_charset_utf8(ctype)            文本类 Content-Type 强制 charset=utf-8
+                                          （T1 编码链路鲁棒化，双后端共用）
     valid_host(host_header, bind)         结构校验 + 端口校验 + IP 字面量放行 +
                                          主机名钉扎（防 Host 投毒/DNS rebinding）
     validate_iface(raw) / valid_month()   参数边界：iface 字符集 ^[A-Za-z0-9._-]{1,64}$；
@@ -196,6 +198,37 @@ def security_headers(path, is_secure=False) -> dict:
     return h
 
 
+# ---------------------------------------------------------------- 编码链路（T1）
+
+def ensure_charset_utf8(ctype) -> str:
+    """文本类 Content-Type 强制 charset=utf-8（双后端共用，T1 编码链路鲁棒化）。
+
+    乱码第一性原理：浏览器对文本资源按 响应头 charset 参数 → 页面内 meta 的
+    顺序确定解码字符集；反代剥 charset / 旧缓存 / 国产浏览器系统默认（GBK）
+    都可能让 UTF-8 内容按错误编码解码。此原语保证全文本资源
+    （html/js/css/json/svg）的 Content-Type 一律携带 charset=utf-8：
+
+    - None / 空 → 原样返回（不注入空头）；
+    - 已含 charset（如 "text/html; charset=utf-8"）→ 原样返回（不重复追加）；
+    - text/*（html/css/js/txt 等）与 application/json、application/javascript、
+      application/x-javascript、image/svg+xml → 追加 "; charset=utf-8"；
+    - 其余类型（image/png、application/octet-stream 等）→ 原样返回。
+
+    注：mimetypes.guess_type 在部分平台/旧 Python（OpenWrt/NAS）对 .js 返回
+    application/javascript，故显式纳入，防静态资源漏网。
+    """
+    if not ctype:
+        return ctype
+    if "charset" in ctype.lower():
+        return ctype
+    base = ctype.split(";", 1)[0].strip().lower()
+    if (base.startswith("text/")
+            or base in ("application/json", "application/javascript",
+                        "application/x-javascript", "image/svg+xml")):
+        return ctype + "; charset=utf-8"
+    return ctype
+
+
 # ---------------------------------------------------------------- Host 校验
 
 def valid_host(host_header: str, bind: str) -> bool:
@@ -361,6 +394,27 @@ def _self_test() -> None:
     check("HTTPS 追加 HSTS / HTTP 不追加",
           "Strict-Transport-Security" in security_headers("/", True)
           and "Strict-Transport-Security" not in security_headers("/", False))
+
+    # ---- ensure_charset_utf8（T1 编码链路鲁棒化） ----
+    check("charset 强制 text/html",
+          ensure_charset_utf8("text/html") == "text/html; charset=utf-8")
+    check("charset 强制 text/css / text/javascript",
+          ensure_charset_utf8("text/css") == "text/css; charset=utf-8"
+          and ensure_charset_utf8("text/javascript") == "text/javascript; charset=utf-8")
+    check("charset 强制 json / application-javascript / svg",
+          ensure_charset_utf8("application/json") == "application/json; charset=utf-8"
+          and ensure_charset_utf8("application/javascript")
+          == "application/javascript; charset=utf-8"
+          and ensure_charset_utf8("application/x-javascript")
+          == "application/x-javascript; charset=utf-8"
+          and ensure_charset_utf8("image/svg+xml") == "image/svg+xml; charset=utf-8")
+    check("已含 charset 不重复追加",
+          ensure_charset_utf8("text/html; charset=utf-8") == "text/html; charset=utf-8"
+          and ensure_charset_utf8("text/html; charset=gbk") == "text/html; charset=gbk")
+    check("非文本类型不加 charset",
+          ensure_charset_utf8("image/png") == "image/png"
+          and ensure_charset_utf8("application/octet-stream") == "application/octet-stream"
+          and ensure_charset_utf8(None) is None and ensure_charset_utf8("") == "")
 
     # ---- valid_host ----
     check("Host 缺失 → False", not valid_host("", "0.0.0.0"))

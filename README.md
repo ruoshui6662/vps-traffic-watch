@@ -1,6 +1,6 @@
 # VPS 流量统计监控系统（vpsmon）
 
-单机部署的轻量 VPS 流量监控服务：统计所选网卡的**月度入站/出站流量**，同时展示 CPU、内存、磁盘占用与实时速率。一条命令安装，浏览器访问 `http://<IP>:<port>` 即可查看美观的深色仪表盘。
+单机部署的轻量 VPS 流量监控服务：统计所选网卡的**月度入站/出站流量**，同时展示 CPU、内存、磁盘占用与实时速率。一条命令安装，浏览器访问 `http://<IP>:<port>` 即可查看**深色玻璃拟态（glassmorphism）风格**的实时仪表盘（本地托管 ECharts，零外网依赖）。
 
 技术栈：**Python 3 + SQLite + ECharts**。Web 与采集为**双后端自动选择**——Flask/psutil 可用时走标准路径（VPS）；无 Flask/psutil 时自动降级**纯标准库**（`/proc` 采集 + `http.server`，OpenWrt 路由器 / NAS 等精简环境），6 个 API 端点与安全行为两后端**逐字段一致**。采集线程每 `interval` 秒写入一条样本，API 只读；一切速率与月度/日度流量由查询时基于内核累计计数**正增量**推导，天然免疫计数器重置与进程重启。
 
@@ -541,6 +541,16 @@ ls /var/lib/vpsmon             # 数据目录默认保留；如已确认删除�
 **13. 为什么卸载用 `sudo bash uninstall.sh` 而不是直接执行？**
 
 卸载脚本需要 root 权限删除系统目录与系统用户，且 `sudo bash uninstall.sh` 不依赖脚本执行位、兼容性更好（即使从 `/opt/vpsmon/` 远程/本地任意位置调用均可）；脚本开头也会做 root 检查并给出 `sudo bash uninstall.sh` 提示。
+
+**14. 页面出现乱码（中文显示为乱码/方块）？**
+
+vpsmon 已内置**双保险编码防御**：所有文本资源（HTML/JS/CSS/JSON）的响应头统一强制 `charset=utf-8`；HTML 头部同时带 `<meta charset="UTF-8">` 与 `<meta http-equiv="Content-Type" content="text/html; charset=utf-8">`（双 meta 兜底旧缓存与远古浏览器）。若仍看到乱码，多为**旧缓存或浏览器解码设置**导致，按顺序排查：
+
+- **硬刷新**：`Ctrl+F5`（Windows/Linux）或 `Cmd+Shift+R`（macOS），强制绕过本地缓存重新拉取全部资源；
+- **清缓存**：在浏览器设置中清除该站点的缓存与站点数据后重试（版本升级后首次访问建议直接清一次）；
+- **确认访问地址**：直接访问 vpsmon 本机地址（`http://<IP>:<port>`），避免经第三方网页跳转/镜像加载旧页面；
+- **国产浏览器极速/兼容模式**：使用 360 / QQ / 搜狗等浏览器时切换到**极速模式**（Chromium 内核默认 UTF-8 解码）；兼容模式可能按系统默认（GBK）解码导致乱码；
+- **反向代理补 charset**：若经 Nginx/Caddy 等反代访问，确认代理**未剥离**响应头 `Content-Type` 中的 `charset=utf-8`（默认透传即可）；个别反代配置了 `charset` 指令时请确保其为 `utf-8`。
 
 ---
 

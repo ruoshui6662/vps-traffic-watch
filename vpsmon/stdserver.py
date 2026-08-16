@@ -18,7 +18,8 @@ SPEC §13.2.3：与 Flask 版共用 api.py 纯处理器 handle_* 与 security.py
 - 全请求先 Host 校验（与 app.py before_request 一致）；全响应注入安全头；
 - 日志 query 串脱敏（复用 app._QueryRedactFilter 语义 → vpsmon.http logger）；
 - TLS：ssl.SSLContext(PROTOCOL_TLS_SERVER) 包裹 socket；证书缺失 fail-closed；
-- 静态文件：realpath 前缀防穿越 + mimetypes.guess_type + nosniff。
+- 静态文件：realpath 前缀防穿越 + mimetypes.guess_type + nosniff +
+  text/* 统一 charset=utf-8（T1 编码链路，security.ensure_charset_utf8）。
 
 create_server(cfg, storage, collector) 返回可 serve_forever/shutdown 的 Server。
 自检：python -m vpsmon.stdserver --self-test（无 Flask 可跑；契约对比需 Flask
@@ -276,6 +277,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "not found"})
             return
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        # T1 编码链路鲁棒化：OpenWrt/NAS 的 mimetypes.guess_type 对 js/css 返回
+        # 无 charset 后缀的类型，统一强制 charset=utf-8（含 application/javascript、
+        # image/svg+xml 等平台差异类型，见 security.ensure_charset_utf8）。
+        ctype = security_mod.ensure_charset_utf8(ctype)
         self._serve_file(full, ctype)
 
     def _serve_file(self, full, ctype):
@@ -468,6 +473,19 @@ def _self_test() -> None:
         st2, b2, hdrs = http_get("/static/js/app.js")
         check("static 200 + nosniff", st2 == 200
               and hdrs.get("x-content-type-options") == "nosniff")
+
+        # ---- T1 编码链路：全文本资源 charset=utf-8（真实端口 HTTP 断言） ----
+        st2, b2, hdrs = http_get("/")
+        check("GET / charset=utf-8",
+              st2 == 200 and "charset=utf-8" in (hdrs.get("content-type") or ""))
+        for p in ("/static/js/app.js", "/static/css/style.css",
+                  "/static/vendor/echarts.min.js"):
+            st2, b2, hdrs = http_get(p)
+            check("%s charset=utf-8" % p,
+                  st2 == 200 and "charset=utf-8" in (hdrs.get("content-type") or ""))
+        st2, b2, hdrs = http_get("/api/status", headers=H)
+        check("API JSON charset=utf-8",
+              st2 == 200 and "charset=utf-8" in (hdrs.get("content-type") or ""))
 
         # ---- 路由：404/405 ----
         st2, b2, _ = http_get("/api/nonexistent", headers=H)

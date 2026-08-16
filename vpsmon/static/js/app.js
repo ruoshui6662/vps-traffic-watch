@@ -227,16 +227,38 @@
     });
   }
 
-  var tooltipStyle = {
-    backgroundColor: 'rgba(13, 20, 36, 0.92)',
-    borderColor: 'rgba(255,255,255,0.12)',
-    borderWidth: 1,
-    textStyle: { color: '#e6edf7', fontSize: 12 },
-    extraCssText: 'border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.4);'
+  /* ECharts 统一配色主题：cyan→violet 渐变系、弱化网格线、深色玻璃 tooltip */
+  var ECHART = {
+    cyan: '#22d3ee',
+    cyanLight: '#67e8f9',
+    cyanDeep: '#0891b2',
+    purple: '#a78bfa',
+    purpleLight: '#c4b5fd',
+    purpleDeep: '#7c3aed',
+    amber: '#fbbf24',
+    text: '#e6edf7',
+    dim: '#8290a6'
   };
-  var axisLabelStyle = { color: '#8290a6', fontSize: 11 };
-  var splitLineStyle = { lineStyle: { color: 'rgba(255,255,255,0.06)' } };
-  var axisLineStyle = { lineStyle: { color: 'rgba(255,255,255,0.12)' } };
+  /* 纵向渐变辅助：折线填充 / 柱状渐变统一 */
+  function gradArea(top, bottom) {
+    return {
+      type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+      colorStops: [
+        { offset: 0, color: top },
+        { offset: 1, color: bottom }
+      ]
+    };
+  }
+  var tooltipStyle = {
+    backgroundColor: 'rgba(10, 16, 30, 0.88)',
+    borderColor: 'rgba(255,255,255,0.10)',
+    borderWidth: 1,
+    textStyle: { color: ECHART.text, fontSize: 12 },
+    extraCssText: 'border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.45),0 0 0 1px rgba(34,211,238,.05);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);'
+  };
+  var axisLabelStyle = { color: ECHART.dim, fontSize: 11 };
+  var splitLineStyle = { lineStyle: { color: 'rgba(255,255,255,0.045)' } };
+  var axisLineStyle = { lineStyle: { color: 'rgba(255,255,255,0.10)' } };
 
   function initCharts() {
     /* 实时速率折线图 */
@@ -244,6 +266,8 @@
     rateChart.setOption({
       backgroundColor: 'transparent',
       animationDuration: 400,
+      animationDurationUpdate: 300,
+      aria: { enabled: true, description: '近 30 分钟实时网络速率折线图，包含入站与出站流量' },
       tooltip: Object.assign({
         trigger: 'axis',
         axisPointer: { type: 'line', lineStyle: { color: 'rgba(255,255,255,0.2)' } },
@@ -286,31 +310,21 @@
       series: [
         {
           name: '入站', type: 'line', smooth: 0.35, symbol: 'none',
-          lineStyle: { width: 2.2, color: '#22d3ee' },
-          itemStyle: { color: '#22d3ee' },
+          lineStyle: { width: 2.4, color: ECHART.cyan },
+          itemStyle: { color: ECHART.cyan },
+          emphasis: { focus: 'series' },
           areaStyle: {
-            color: {
-              type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-              colorStops: [
-                { offset: 0, color: 'rgba(34,211,238,0.28)' },
-                { offset: 1, color: 'rgba(34,211,238,0.01)' }
-              ]
-            }
+            color: gradArea('rgba(34,211,238,0.32)', 'rgba(34,211,238,0.01)')
           },
           data: []
         },
         {
           name: '出站', type: 'line', smooth: 0.35, symbol: 'none',
-          lineStyle: { width: 2.2, color: '#a78bfa' },
-          itemStyle: { color: '#a78bfa' },
+          lineStyle: { width: 2.4, color: ECHART.purple },
+          itemStyle: { color: ECHART.purple },
+          emphasis: { focus: 'series' },
           areaStyle: {
-            color: {
-              type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-              colorStops: [
-                { offset: 0, color: 'rgba(167,139,250,0.26)' },
-                { offset: 1, color: 'rgba(167,139,250,0.01)' }
-              ]
-            }
+            color: gradArea('rgba(167,139,250,0.28)', 'rgba(167,139,250,0.01)')
           },
           data: []
         }
@@ -332,7 +346,7 @@
           show: true, width: 11, roundCap: true,
           itemStyle: { color: color, shadowColor: color, shadowBlur: 8 }
         },
-        axisLine: { lineStyle: { width: 11, color: [[1, 'rgba(255,255,255,0.07)']] } },
+        axisLine: { lineStyle: { width: 11, color: [[1, 'rgba(255,255,255,0.06)']] } },
         axisTick: { show: false },
         splitLine: { show: false },
         axisLabel: { show: false },
@@ -340,12 +354,12 @@
         anchor: { show: false },
         title: {
           offsetCenter: [0, '38%'],
-          color: '#8290a6', fontSize: 12, fontWeight: 500
+          color: ECHART.dim, fontSize: 12, fontWeight: 500
         },
         detail: {
           valueAnimation: true,
           offsetCenter: [0, '62%'],
-          color: '#e6edf7', fontSize: 13, fontWeight: 700,
+          color: ECHART.text, fontSize: 13, fontWeight: 700,
           formatter: function () { return gaugeText[name] || '--'; }
         },
         data: [{ value: 0, name: name }]
@@ -354,10 +368,11 @@
     gaugeChart = echarts.init($('chart-gauges'));
     gaugeChart.setOption({
       backgroundColor: 'transparent',
+      aria: { enabled: true, description: 'CPU、内存与磁盘使用率仪表盘' },
       series: [
-        mkGauge('CPU', '#22d3ee'),
-        mkGauge('内存', '#a78bfa'),
-        mkGauge('磁盘', '#fbbf24')
+        mkGauge('CPU', ECHART.cyan),
+        mkGauge('内存', ECHART.purple),
+        mkGauge('磁盘', ECHART.amber)
       ]
     });
     layoutGauges();
@@ -367,6 +382,8 @@
     monthlyChart.setOption({
       backgroundColor: 'transparent',
       animationDuration: 600,
+      animationDurationUpdate: 300,
+      aria: { enabled: true, description: '近 12 个月入站与出站流量柱状图' },
       tooltip: Object.assign({
         trigger: 'axis',
         axisPointer: { type: 'shadow', shadowStyle: { color: 'rgba(255,255,255,0.04)' } },
@@ -403,31 +420,21 @@
       },
       series: [
         {
-          name: '入站', type: 'bar', barMaxWidth: 22,
+          name: '入站', type: 'bar', barMaxWidth: 24,
           itemStyle: {
-            borderRadius: [5, 5, 0, 0],
-            color: {
-              type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-              colorStops: [
-                { offset: 0, color: '#67e8f9' },
-                { offset: 1, color: '#0891b2' }
-              ]
-            }
+            borderRadius: [6, 6, 0, 0],
+            color: gradArea(ECHART.cyanLight, ECHART.cyanDeep)
           },
+          emphasis: { itemStyle: { shadowBlur: 12, shadowColor: 'rgba(34,211,238,0.35)' } },
           data: []
         },
         {
-          name: '出站', type: 'bar', barMaxWidth: 22,
+          name: '出站', type: 'bar', barMaxWidth: 24,
           itemStyle: {
-            borderRadius: [5, 5, 0, 0],
-            color: {
-              type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-              colorStops: [
-                { offset: 0, color: '#c4b5fd' },
-                { offset: 1, color: '#7c3aed' }
-              ]
-            }
+            borderRadius: [6, 6, 0, 0],
+            color: gradArea(ECHART.purpleLight, ECHART.purpleDeep)
           },
+          emphasis: { itemStyle: { shadowBlur: 12, shadowColor: 'rgba(167,139,250,0.35)' } },
           data: []
         }
       ]

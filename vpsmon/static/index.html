@@ -2,6 +2,8 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<!-- T1 编码链路：响应头 charset 被反代剥离/旧缓存命中时的兜底（兼容模式/远古浏览器保险） -->
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VPS 流量监控</title>
 <meta name="description" content="VPS 流量统计监控仪表盘：月度入站/出站流量、CPU、内存、磁盘实时监控">
@@ -19,7 +21,7 @@
     </div>
     <div class="brand-text">
       <h1>VPS 流量监控</h1>
-      <div class="sub" id="host-sub"><span class="dot"></span>主机 <span id="host-addr">连接中…</span> · 网卡 <span id="iface-name">--</span></div>
+      <div class="sub" id="host-sub"><span class="dot" aria-hidden="true"></span>主机 <span id="host-addr" class="sub-chip">连接中…</span> · 网卡 <span id="iface-name" class="sub-chip">--</span></div>
     </div>
   </div>
 
@@ -34,7 +36,7 @@
     </div>
     <div class="hstat">
       <span class="label">数据新鲜度</span>
-      <span class="value" id="freshness"><span class="pill pending">连接中…</span></span>
+      <span class="value" id="freshness" role="status" aria-live="polite"><span class="pill pending">连接中…</span></span>
     </div>
   </div>
 
@@ -110,7 +112,7 @@
 
     <div class="card chart-card chart-card-wide">
       <div class="card-head">
-        <h2>实时网络速率</h2>
+        <h2><span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13"><path d="M3 12h4l3-8 4 16 3-8h4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>实时网络速率</h2>
         <div class="badge" id="rate-badge">近 30 分钟 · 入站 -- / 出站 --</div>
       </div>
       <div id="chart-rate" class="chart"></div>
@@ -118,7 +120,7 @@
 
     <div class="card chart-card">
       <div class="card-head">
-        <h2>系统负载</h2>
+        <h2><span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13"><path d="M5 19a9 9 0 1 1 14 0" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M12 19l3.2-6.4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>系统负载</h2>
         <div class="badge">CPU / 内存 / 磁盘</div>
       </div>
       <div id="chart-gauges" class="chart"></div>
@@ -126,7 +128,7 @@
 
     <div class="card chart-card chart-card-full">
       <div class="card-head">
-        <h2>近 12 个月流量</h2>
+        <h2><span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13"><rect x="4" y="11" width="4" height="9" rx="1" fill="currentColor"/><rect x="10" y="6" width="4" height="14" rx="1" fill="currentColor"/><rect x="16" y="9" width="4" height="11" rx="1" fill="currentColor"/></svg></span>近 12 个月流量</h2>
         <div class="badge" id="monthly-badge">月度入站 / 出站（字节）</div>
       </div>
       <div id="chart-monthly" class="chart"></div>
@@ -152,7 +154,7 @@
 <div class="modal" id="token-modal" hidden>
   <div class="modal-mask"></div>
   <div class="modal-card">
-    <h3>需要访问令牌</h3>
+    <h3><span class="modal-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="15" height="15"><path d="M12 3l7 3v5c0 4.6-3 8.4-7 10-4-1.6-7-5.4-7-10V6l7-3z" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linejoin="round"/><path d="M9.5 12l1.8 1.8 3.4-3.6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>需要访问令牌</h3>
     <p>该服务已开启 token 鉴权，请输入访问令牌后继续。</p>
     <input id="modal-token-input" type="password" placeholder="访问令牌 (token)" autocomplete="off" spellcheck="false">
     <div class="modal-actions">

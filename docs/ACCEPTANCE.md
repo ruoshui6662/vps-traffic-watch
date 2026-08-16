@@ -207,3 +207,68 @@
 3. **LICENSE CRLF**——非阻塞，可选统一为 LF。
 
 **最终结论：T1–T8 全部交付物通过 T6 双平台回归验收；README OpenWrt 章节交付完成；发布面就绪。可交付。**
+
+## 10. T3 编码与美化验证、文档收尾（ui_reviewer 交付）— 追加
+
+验证环境：Windows 10 / Python 3.12.10 / Node v24.18.0；Flask 3.1.3 经 `.piptmp/vendor`（PYTHONPATH）提供；psutil 缺失（= OpenWrt 纯标准库模拟）。T1 改动（security.py `ensure_charset_utf8` + app.py after_request + stdserver 静态服务 + index.html 双 meta）、T2 改动（style.css 重写 + index.html class/aria/SVG + app.js ECharts 主题）逐项验证如下。
+
+### 10.1 编码验证：双服务器真实响应头矩阵
+
+双后端分别起真实服务（Flask `--port 18102` / stdlib `--port 18103`，token=sekrit），复用 `.devtest/t1_matrix_probe.py` 断言：
+
+| 资源 | Flask 18102 | stdlib 18103 |
+|---|---|---|
+| `/` | ✅ 200 `text/html; charset=utf-8` | ✅ 200 `text/html; charset=utf-8` |
+| `/static/js/app.js` | ✅ 200 `text/javascript; charset=utf-8` | ✅ 200 `text/javascript; charset=utf-8` |
+| `/static/css/style.css` | ✅ 200 `text/css; charset=utf-8` | ✅ 200 `text/css; charset=utf-8` |
+| `/static/vendor/echarts.min.js` | ✅ 200 `text/javascript; charset=utf-8` | ✅ 200 `text/javascript; charset=utf-8` |
+| `/api/status` | ✅ 200 `application/json; charset=utf-8` | ✅ 200 `application/json; charset=utf-8` |
+
+5/5 PASS × 双后端。注意两后端对 `.js` 均返回 `text/javascript`（本机 mimetypes 平台差异），charset=utf-8 仍被强制附加——恰为 T1 加固目标场景。
+
+### 10.2 编码验证：/ 响应体（新增 `.devtest/t3_body_probe.py`）
+
+- ✅ 响应体严格 UTF-8 解码合法（无 UnicodeDecodeError、无 U+FFFD 替换字符）；
+- ✅ 含正确中文：「VPS 流量监控」「流量监控」「本月入站流量」；
+- ✅ **GBK 解码证明**：`body.decode("gbk")` 抛 `UnicodeDecodeError` → 字节为纯 UTF-8，无 GBK 混淆内容；
+- ✅ HTML `<head>` 双 meta 齐备：`<meta charset="UTF-8">` + `<meta http-equiv="Content-Type" content="text/html; charset=utf-8">`，且均位于 head 前 512 字节；
+- ✅ 双后端结果逐项一致。
+
+### 10.3 编码验证：文件层
+
+security.py / app.py / stdserver.py / index.html / style.css / app.js / echarts.min.js 共 7 个文件：全部 **无 BOM + UTF-8 合法**（7/7 PASS）。
+
+### 10.4 前端回归
+
+- ✅ `node --check vpsmon/static/js/app.js` → 语法 PASS；
+- ✅ `node scripts/check_frontend_ids.js` → HTML ids **37 个**，JS 引用集合一致，`[PASS]` 退出码 0；
+- ✅ **静态资源零外部引用**：`.devtest/t3_extref_probe.py` 对作者文件（index.html/style.css/app.js）匹配 `src=`/`href=`/`url(` 直连 http(s) → **0 命中**（favicon 为 `data:` URI 除外；echarts.min.js 内仅有 Apache/zrender LICENSE 注释与 W3C XML 命名空间常量，均非资源加载；style.css 无 `@import`/`@font-face`）。
+
+### 10.5 功能回归
+
+- ✅ 模块自检全过：security 52/52、storage 全过、collector 20/20、procmetrics 22/22、config 26/26；
+- ✅ `python -m vpsmon.stdserver --self-test` → **56/56**（含真实端口 HTTP 断言 + 双后端逐字段契约对比 14 路径：6 API + 5 错误路径 + `/` + 静态 + 穿越）；
+- ✅ `python -m vpsmon.app --selftest`（Flask 端到端）→ **56/56**；
+- ✅ **.devtest 契约双后端一致**（integration.py 对双后端真实运行实例）：
+
+| 场景 | Flask | stdlib | 一致 |
+|---|---|---|---|
+| empty（空库） | 31/31 | 31/31 | ✅ |
+| seeded（2 个月预置） | 26/26 | 26/26 | ✅ |
+| token（鉴权） | 10/10 | 10/10 | ✅ |
+
+> 注：seeded 场景首次运行失败为**夹具过期**（`.devtest/seeded/vpsmon.db` 为 0 样本空库；seed.py 输出在 `.devtest/seeded.db`）。已按 seed.py 流程重播种 13 条确定性样本并同步两份夹具 + `seed_meta.json` 锚点（`.devtest/` 为 gitignore 开发区，不入库），随后双后端 26/26 全过——**非代码回归**。
+
+### 10.6 文档交付
+
+- ✅ README FAQ 新增 **第 14 条「页面出现乱码」排查**（硬刷新 Ctrl+F5/Cmd+Shift+R → 清缓存 → 确认访问地址 → 国产浏览器极速模式 → 反代补 charset），与 T1 双保险编码防御呼应；
+- ✅ README 简介界面描述微调：深色仪表盘 → **深色玻璃拟态（glassmorphism）风格**；
+- ✅ 验收报告追加至本文件（§10）；新增可复用探针 `.devtest/t3_body_probe.py`、`.devtest/t3_extref_probe.py`。
+
+### 10.7 残留风险与建议
+
+1. `.js` 的 Content-Type 依赖平台 mimetypes（本机为 `text/javascript`，OpenWrt 可能为 `application/javascript`）——两者均已由 `ensure_charset_utf8` 覆盖强制 charset，无风险；
+2. 国产浏览器兼容模式按系统 GBK 解码属客户端行为，服务端双保险无法完全覆盖，README FAQ 14 已给出切换指引；
+3. 建议发布前在 Linux 实机（含 Flask 与 OpenWrt stdlib 两路径）各 curl 一次响应头复核。
+
+**最终结论：T1 编码链路鲁棒化 + T2 仪表盘美化 + T3 验证文档收尾全部通过验收；编码矩阵、渲染验证、功能契约、前端一致性、文档交付逐项 PASS，可进入 GitHub 同步。**

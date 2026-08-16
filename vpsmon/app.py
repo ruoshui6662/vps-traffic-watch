@@ -147,6 +147,17 @@ def create_app(cfg, storage, collector):
             resp.headers[k] = v
         return resp
 
+    @app.after_request
+    def _charset_utf8(resp):
+        # T1 编码链路鲁棒化：文本类资源（html/js/css/json/svg）Content-Type
+        # 统一强制 charset=utf-8（与 stdlib 后端共用 security.ensure_charset_utf8）。
+        # 防反代剥 charset / 旧缓存 / 国产浏览器按系统默认（GBK）解码导致乱码。
+        # Flask after_request 按注册逆序执行；本钩子与 _security_headers 互不依赖。
+        ctype = security_mod.ensure_charset_utf8(resp.headers.get("Content-Type") or "")
+        if ctype:
+            resp.headers["Content-Type"] = ctype
+        return resp
+
     @app.errorhandler(404)
     def not_found(_e):
         return jsonify({"ok": False, "error": "not found"}), 404
@@ -318,6 +329,21 @@ def _self_test() -> int:
               and r.headers.get("X-Content-Type-Options") == "nosniff")
         check("static Cache-Control public",
               (r.headers.get("Cache-Control") or "").startswith("public"))
+
+        # ---- T1 编码链路：全文本资源 charset=utf-8 ----
+        r = c.get("/")
+        check("GET / Content-Type 带 charset=utf-8",
+              "charset=utf-8" in (r.headers.get("Content-Type") or ""))
+        for p in ("/static/js/app.js", "/static/css/style.css",
+                  "/static/vendor/echarts.min.js"):
+            r = c.get(p)
+            check("%s 200 + charset=utf-8" % p,
+                  r.status_code == 200
+                  and "charset=utf-8" in (r.headers.get("Content-Type") or ""))
+        r = c.get("/api/status", headers={"X-Token": "sekrit"})
+        check("API JSON charset=utf-8",
+              r.status_code == 200
+              and "charset=utf-8" in (r.headers.get("Content-Type") or ""))
 
         # ---- 鉴权（默认仅 X-Token） ----
         r = c.get("/api/status")
