@@ -330,7 +330,7 @@ curl -fsSL https://raw.githubusercontent.com/ruoshui6662/vps-traffic-watch/main/
 
 > `--port` **必填**：OpenWrt 分支沿用 VPS 版端口解析规则——非交互/管道模式不提供 `--port`（或 `VPSMON_PORT`）即报错退出，不静默默认 8080。token 默认自动生成强随机 128bit（仅本次安装输出显示，请妥善保存）。
 
-安装后自检：`curl -H "X-Token: <token>" http://127.0.0.1:9090/api/status` 应返回 `"ok": true`。
+安装后自检：`curl -H "X-Token: <token>" http://127.0.0.1:9090/api/status` 应返回含 `"ok":true` 的 JSON（Flask 3.x 输出紧凑格式，`"ok"` 与 `true` 间无空格；安装脚本自检判据用 JSON 解析顶层 `ok` 字段，不依赖任何空格/格式）。
 
 ### procd 服务管理（替代 systemctl）
 

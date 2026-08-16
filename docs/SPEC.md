@@ -801,7 +801,7 @@ uci commit firewall
 
 #### 13.3.8 端口/token 交互复用
 
-`resolve_port` / `resolve_token_prompt` / `generate_token` / `validate_interval` **原样复用现有逻辑，不重复实现**：非交互管道模式必须 `--port`/`VPSMON_PORT`；token 默认自动生成强随机 128bit；`--token ""` 显式不鉴权（醒目警告）。自检命令：`curl -fsS -H "X-Token: <token>" http://127.0.0.1:<PORT>/api/status | grep -q '"ok": true'`。
+`resolve_port` / `resolve_token_prompt` / `generate_token` / `validate_interval` **原样复用现有逻辑，不重复实现**：非交互管道模式必须 `--port`/`VPSMON_PORT`；token 默认自动生成强随机 128bit；`--token ""` 显式不鉴权（醒目警告）。自检命令：`curl -fsS -H "X-Token: <token>" http://127.0.0.1:<PORT>/api/status | python3 -c 'import sys, json; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)'`——判据为 **JSON 真解析（格式无关）**：python3 解析顶层 `ok` 字段为真即通过。Flask 3.x `jsonify` 输出紧凑 JSON（`"ok":true` 无空格），旧 `grep -q '"ok": true'`（带空格）永假，导致服务正常却被误判"自检失败、安装未完全成功"，故不再使用文本匹配。
 
 ### 13.4 运维说明（procd / logread）
 

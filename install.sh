@@ -573,16 +573,18 @@ EOF
 # ---------- OpenWrt curl 自检（与 systemd 版 start_and_check 等价；日志看 logread） ----------
 openwrt_start_and_check() {
   info "自检: curl http://127.0.0.1:${PORT}/api/status"
+  # 判据: python3 解析顶层 ok 字段——Flask 3.x jsonify 输出紧凑 JSON（"ok":true 无空格），
+  # 旧 grep '"ok": true' 永假导致误报自检失败；python3 由 install_system_deps 保证存在
   local i
   for i in $(seq 1 10); do
     if [ -n "$TOKEN" ]; then
       if curl -fsS --max-time 3 -H "X-Token: $TOKEN" \
-          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | grep -q '"ok": true'; then
+          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | python3 -c 'import sys, json; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' 2>/dev/null; then
         return 0
       fi
     else
       if curl -fsS --max-time 3 \
-          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | grep -q '"ok": true'; then
+          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | python3 -c 'import sys, json; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' 2>/dev/null; then
         return 0
       fi
     fi
@@ -1208,16 +1210,18 @@ start_and_check() {
   systemctl enable --now "$SERVICE_NAME"
 
   info "自检: curl http://127.0.0.1:${PORT}/api/status"
+  # 判据: python3 解析顶层 ok 字段——Flask 3.x jsonify 输出紧凑 JSON（"ok":true 无空格），
+  # 旧 grep '"ok": true' 永假导致误报自检失败；python3 由 install_system_deps 保证存在
   local i
   for i in $(seq 1 10); do
     if [ -n "$TOKEN" ]; then
       if curl -fsS --max-time 3 -H "X-Token: $TOKEN" \
-          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | grep -q '"ok": true'; then
+          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | python3 -c 'import sys, json; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' 2>/dev/null; then
         return 0
       fi
     else
       if curl -fsS --max-time 3 \
-          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | grep -q '"ok": true'; then
+          "http://127.0.0.1:${PORT}/api/status" 2>/dev/null | python3 -c 'import sys, json; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' 2>/dev/null; then
         return 0
       fi
     fi
