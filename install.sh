@@ -38,6 +38,7 @@ OPENWRT_DATA_DIR="/etc/vpsmon"
 OPENWRT_CONFIG_FILE="${OPENWRT_DATA_DIR}/config.json"
 OPENWRT_INIT_FILE="/etc/init.d/vpsmon"
 OPENWRT_FIREWALL_MARKER="${OPENWRT_DATA_DIR}/.firewall-rule"
+OPENWRT_PLATFORM=0   # 1 = OpenWrt/ImmortalWrt 平台（detect_distro 时置位；包管理器 opkg 或 apk 均可能）
 
 # ---------- 默认参数 ----------
 PORT=""            # 监听端口（不再静默默认 8080；交互输入或 --port/VPSMON_PORT 指定）
@@ -263,8 +264,9 @@ resolve_token_generate() {
 }
 
 # ---------- OpenWrt 平台判定（安装/卸载共用；SPEC §13.3.1） ----------
-# 命中任一即视为 OpenWrt: /etc/openwrt_release 存在 / command -v opkg / os-release 的
-# ID 或 ID_LIKE 含 openwrt。
+# 命中任一即视为 OpenWrt/ImmortalWrt: /etc/openwrt_release 存在 / command -v opkg /
+# os-release 的 ID 或 ID_LIKE 含 openwrt 或 immortalwrt。
+# 注意: 新版 OpenWrt/ImmortalWrt（24.10+）包管理器已从 opkg 换成 apk，此处不能依赖 opkg 命令存在。
 is_openwrt() {
   if [ -f /etc/openwrt_release ] || command -v opkg >/dev/null 2>&1; then
     return 0
@@ -274,6 +276,7 @@ is_openwrt() {
     . /etc/os-release
     case "$ID:$ID_LIKE" in
       *openwrt*) return 0 ;;
+      *immortalwrt*) return 0 ;;
     esac
   fi
   return 1
@@ -282,10 +285,19 @@ is_openwrt() {
 # ---------- 发行版检测 ----------
 detect_distro() {
   if [ ! -r /etc/os-release ]; then
-    if command -v opkg >/dev/null 2>&1; then
-      PKG_MGR="opkg"
+    if is_openwrt; then
+      OPENWRT_PLATFORM=1
+      if command -v opkg >/dev/null 2>&1; then
+        PKG_MGR="opkg"
+        info "检测到发行版: openwrt（无 os-release，由 opkg 判定），包管理器: opkg"
+      elif command -v apk >/dev/null 2>&1; then
+        PKG_MGR="apk"
+        info "检测到发行版: openwrt（无 os-release，由 apk 判定），包管理器: apk"
+      else
+        err "检测到 OpenWrt 平台，但未找到 opkg 或 apk 包管理器，无法安装依赖"
+        exit 1
+      fi
       PKG_PY="python3 curl ca-bundle"
-      info "检测到发行版: openwrt（无 os-release，由 opkg 判定），包管理器: opkg"
       return 0
     fi
     err "未找到 /etc/os-release，无法识别发行版"
@@ -294,9 +306,18 @@ detect_distro() {
   # shellcheck disable=SC1091
   . /etc/os-release
   if is_openwrt; then
-    PKG_MGR="opkg"
+    OPENWRT_PLATFORM=1
     PKG_PY="python3 curl ca-bundle"   # python3 = 完整包（python3-light 缺 sqlite3/http.server）
-    info "检测到发行版: openwrt，包管理器: opkg"
+    if command -v opkg >/dev/null 2>&1; then
+      PKG_MGR="opkg"
+      info "检测到发行版: openwrt，包管理器: opkg"
+    elif command -v apk >/dev/null 2>&1; then
+      PKG_MGR="apk"
+      info "检测到发行版: openwrt（apk 系，ImmortalWrt/OpenWrt 24.10+），包管理器: apk"
+    else
+      err "检测到 OpenWrt 平台（ID=$ID），但未找到 opkg 或 apk 包管理器，无法安装依赖"
+      exit 1
+    fi
     return 0
   fi
   case "$ID" in
@@ -332,7 +353,30 @@ install_system_deps() {
     apt) apt-get update -y && apt-get install -y $PKG_PY ;;
     dnf) dnf install -y $PKG_PY ;;
     yum) yum install -y $PKG_PY ;;
-    apk) apk add --no-cache $PKG_PY ;;
+    apk)
+      if [ "$OPENWRT_PLATFORM" = "1" ]; then
+        # OpenWrt/ImmortalWrt 24.10+（apk-tools 系）: 先 update 再 add（--no-cache 为 Alpine 语义，OpenWrt apk 不保证支持）
+        local free_kb
+        free_kb="$(df -P / 2>/dev/null | awk 'NR==2 {print $4}')"
+        if [ -n "$free_kb" ] && [ "$free_kb" -lt 16384 ] 2>/dev/null; then
+          err "可用 Flash 空间不足: $(df -h / 2>/dev/null | awk 'NR==2 {print $4}')（需 ≥ 16MB）"
+          err "python3 完整包安装后占用 10-20MB+，请先清理 overlay 空间（apk del 无用包）后重试"
+          exit 1
+        fi
+        info "存储空间检查通过: $(df -h / 2>/dev/null | awk 'NR==2 {print $4}') 可用（需 ≥ 16MB）"
+        if ! apk update; then
+          err "apk update 失败，请检查网络与软件源配置（/etc/apk/repositories.d 或 /etc/apk/repositories）"
+          err "可手动执行: apk update && apk add $PKG_PY 后重试"
+          exit 1
+        fi
+        if ! apk add $PKG_PY; then
+          err "apk add $PKG_PY 失败，请检查网络与软件源后重试"
+          exit 1
+        fi
+      else
+        apk add --no-cache $PKG_PY
+      fi
+      ;;
     opkg)
       # OpenWrt（SPEC §13.3.2）: 小 Flash 设备先检查 overlay 可用空间（python3 完整包
       # 安装后 10-20MB+，文档要求 ≥16MB 可用），不足时明确报错不静默。
@@ -363,11 +407,12 @@ install_system_deps() {
     err "python3 版本过低（需要 >= 3.8）"
     exit 1
   fi
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     # OpenWrt: 必须用完整包 python3（python3-light 缺 sqlite3/http.server 等模块，启动即崩）
     if ! python3 -c 'import sqlite3, http.server, json, ssl, socketserver' 2>/dev/null; then
       err "检测到 python3 缺 sqlite3/http.server 等模块（可能误装了 python3-light），请安装完整包:"
-      err "  opkg install python3"
+      err "  opkg install python3     （opkg 系）"
+      err "  apk add python3          （apk 系，ImmortalWrt/OpenWrt 24.10+）"
       exit 1
     fi
     info "python3 模块校验通过（sqlite3/http.server/json/ssl/socketserver）"
@@ -376,7 +421,7 @@ install_system_deps() {
 
 # ---------- 创建系统用户 ----------
 create_user() {
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     info "OpenWrt 平台不创建系统用户（无此惯例，服务以 root 运行，见 docs/SPEC.md §13.5）"
     return 0
   fi
@@ -398,14 +443,14 @@ copy_program() {
     err "未找到 $SCRIPT_DIR/vpsmon 包目录，请在项目根目录执行本脚本"
     exit 1
   fi
-  if [ "$PKG_MGR" != "opkg" ] && [ ! -f "$SCRIPT_DIR/requirements.txt" ]; then
+  if [ "$OPENWRT_PLATFORM" != "1" ] && [ ! -f "$SCRIPT_DIR/requirements.txt" ]; then
     err "未找到 $SCRIPT_DIR/requirements.txt"
     exit 1
   fi
   info "复制程序到 $APP_DIR"
   mkdir -p "$APP_DIR"
   cp -r "$SCRIPT_DIR/vpsmon" "$APP_DIR/"
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     # OpenWrt（SPEC §13.3.3）: 仅复制 vpsmon/ 包，无 venv/pip/编译；requirements.txt 供 VPS 用
     info "OpenWrt 平台仅复制 vpsmon/ 包（纯标准库运行，无 pip 依赖）"
   else
@@ -425,7 +470,7 @@ copy_uninstall_script() {
 
 # ---------- 创建虚拟环境并安装依赖 ----------
 setup_venv() {
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     info "OpenWrt 平台跳过 venv/pip（纯标准库运行，无编译依赖；程序目录 root:root 只读）"
     return 0
   fi
@@ -452,7 +497,7 @@ json_escape() {
 
 write_config() {
   local data_dir="$DATA_DIR" cfg_file="$CONFIG_FILE"
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     # OpenWrt（SPEC §13.3.3）: /var 常符号链接到 /tmp（tmpfs）重启清空，配置/数据库
     # 必须放 overlay 的 /etc/vpsmon（jffs2/ubifs/overlayfs），重启后保留。
     data_dir="$OPENWRT_DATA_DIR"
@@ -462,7 +507,7 @@ write_config() {
   info "生成配置 $cfg_file"
   mkdir -p "$data_dir"
   chmod 700 "$data_dir"
-  if [ "$PKG_MGR" != "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" != "1" ]; then
     chown vpsmon:vpsmon "$data_dir"
   fi
   # SECURITY.md §4.10-D: 用 umask 077 子 shell 包裹写入，消除 644 中间窗口（M6）；
@@ -478,7 +523,7 @@ write_config() {
 }
 EOF
   )
-  if [ "$PKG_MGR" != "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" != "1" ]; then
     chown vpsmon:vpsmon "$cfg_file"
   fi
   chmod 600 "$cfg_file"
@@ -682,9 +727,9 @@ openwrt_do_uninstall() {
       warn "检测到非交互执行（stdin 非终端），跳过删除确认，默认保留数据目录 $OPENWRT_DATA_DIR"
     fi
   fi
-  # 6. 不卸载 python3/curl/ca-bundle 等 opkg 包（可能被其他包依赖，卸载第三方包超出本应用职责）
+  # 6. 不卸载 python3/curl/ca-bundle 等 opkg/apk 包（可能被其他包依赖，卸载第三方包超出本应用职责）
   echo
-  info "卸载完成。（未卸载 python3/curl/ca-bundle 等 opkg 包——它们可能被其他包依赖）"
+  info "卸载完成。（未卸载 python3/curl/ca-bundle 等 opkg/apk 包——它们可能被其他包依赖）"
 }
 
 # ---------- OpenWrt 成功信息（SPEC §13.4: 管理用 /etc/init.d/vpsmon，日志用 logread） ----------
@@ -1085,10 +1130,11 @@ selftest() {
         fail=$((fail + 1)); printf '  [FAIL] 缺少 OpenWrt 常量: %s\n' "$c"
       fi
     done
-    # 3) 关键代码片段（opkg/procd/uci/模块校验/is_openwrt）
+    # 3) 关键代码片段（opkg/apk 包管理/procd/uci/模块校验/is_openwrt）
     checks=$((checks + 1))
-    if grep -q 'PKG_MGR="opkg"' "$0" \
+    if grep -q 'OPENWRT_PLATFORM=1' "$0" \
        && grep -q 'opkg update' "$0" \
+       && grep -q 'apk update' "$0" \
        && grep -q 'import sqlite3, http.server' "$0" \
        && grep -q 'procd_open_instance' "$0" \
        && grep -q 'procd_set_param respawn' "$0" \
@@ -1096,15 +1142,17 @@ selftest() {
        && grep -q '^is_openwrt()' "$0"; then
       pass=$((pass + 1))
     else
-      fail=$((fail + 1)); printf '  [FAIL] OpenWrt 关键代码片段缺失（opkg update/模块校验/procd/uci/is_openwrt）\n'
+      fail=$((fail + 1)); printf '  [FAIL] OpenWrt 关键代码片段缺失（opkg/apk update/模块校验/procd/uci/is_openwrt）\n'
     fi
-    # 4) detect_distro / install_system_deps 含 opkg 分支
+    # 4) detect_distro / install_system_deps 含 opkg 与 apk(OpenWrt) 分支
     checks=$((checks + 1))
     if grep -q '^detect_distro()' "$0" && grep -q 'opkg)' "$0" \
-       && grep -q 'opkg install \$PKG_PY' "$0"; then
+       && grep -q 'opkg install $PKG_PY' "$0" \
+       && grep -q 'apk add $PKG_PY' "$0" \
+       && grep -q 'OPENWRT_PLATFORM=1' "$0"; then
       pass=$((pass + 1))
     else
-      fail=$((fail + 1)); printf '  [FAIL] detect_distro/install_system_deps 缺少 opkg 分支\n'
+      fail=$((fail + 1)); printf '  [FAIL] detect_distro/install_system_deps 缺少 opkg/apk(OpenWrt) 分支\n'
     fi
   else
     warn "跳过 OpenWrt 静态断言（无法读取脚本文件 $0，可能经 stdin 管道执行）"
@@ -1201,7 +1249,7 @@ detect_public_ip() {
 # 非交互模式默认只提示（安全优先，不自动放行）。
 firewall_allow() {
   # OpenWrt: uci firewall（fw3/firewall4）分支（SPEC §13.3.6），与 ufw/firewalld 完全隔离
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     openwrt_firewall_allow
     return $?
   fi
@@ -1332,7 +1380,7 @@ firewall_revoke() {
 
 # ---------- 成功信息 ----------
 print_success() {
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     openwrt_print_success
     return $?
   fi
@@ -1476,7 +1524,7 @@ fetch_remote_source() {
   if ! command -v curl >/dev/null 2>&1; then
     err "未找到 curl，无法下载远程源码，请先安装 curl 后重试。"
     if is_openwrt; then
-      err "OpenWrt 请执行: opkg update && opkg install curl ca-bundle（busybox wget 仅作提示性回退）"
+      err "OpenWrt 请先安装 curl: opkg install curl ca-bundle（opkg 系）或 apk add curl ca-bundle（apk 系）"
     fi
     exit 1
   fi
@@ -1572,7 +1620,7 @@ main() {
   setup_venv               # OpenWrt 分支内部跳过（纯标准库，无 venv/pip）
   write_config             # OpenWrt 分支写到 /etc/vpsmon/config.json（overlay）
 
-  if [ "$PKG_MGR" = "opkg" ]; then
+  if [ "$OPENWRT_PLATFORM" = "1" ]; then
     # OpenWrt 分支（SPEC §13.3）: procd 服务 + curl 自检，完全不走 systemd 路径
     if ! openwrt_install_service; then
       err "安装未完全成功。"

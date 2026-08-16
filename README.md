@@ -292,17 +292,23 @@ systemctl disable --now vpsmon   # 停止并取消开机自启
 
 ## OpenWrt 路由器支持
 
-vpsmon 在 OpenWrt 上以**纯标准库**运行（无 Flask/psutil/pip/venv，无需 gcc 编译），由 install.sh 自动识别发行版并走 **opkg + procd + uci** 分支；API 契约与安全基线（docs/SECURITY.md §4.12）与 VPS 版一致。
+vpsmon 在 OpenWrt 上以**纯标准库**运行（无 Flask/psutil/pip/venv，无需 gcc 编译），由 install.sh 自动识别发行版并走 **opkg/apk + procd + uci** 分支（**opkg 系**：OpenWrt ≤ 23.05；**apk 系**：ImmortalWrt、OpenWrt 24.10+ 等新固件）；API 契约与安全基线（docs/SECURITY.md §4.12）与 VPS 版一致。
 
 ### 前置要求
 
-1. **软件源**：系统为 OpenWrt（或含 opkg 的派生固件），先更新：
+1. **bash**：OpenWrt 默认只有 busybox ash，**必须先安装 bash**（安装脚本为 bash 编写）：
    ```bash
-   opkg update
+   # opkg 系（OpenWrt ≤ 23.05）:
+   opkg update && opkg install bash curl
+   # apk 系（ImmortalWrt / OpenWrt 24.10+，opkg 不存在时用 apk）:
+   apk update && apk add bash curl
    ```
-2. **完整版 python3**：`python3-light` 缺 sqlite3/http.server 等模块（启动即崩），必须安装完整包（install.sh 会自动安装并做模块校验）：
+2. **完整版 python3**：`python3-light` 缺 sqlite3/http.server 等模块（启动即崩），必须安装完整包（install.sh 会自动识别 opkg/apk 并安装、做模块校验）：
    ```bash
+   # opkg 系:
    opkg install python3 curl ca-bundle
+   # apk 系:
+   apk add python3 curl ca-bundle
    python3 -c 'import sqlite3, http.server, json, ssl, socketserver'
    ```
 3. **存储空间 ≥ 16MB**：python3 完整包安装后占用 10–20MB+，先 `df -h /` 确认 overlay 可用空间；不足时 install.sh 会明确报错退出（不静默）。

@@ -19,7 +19,7 @@
 # OpenWrt 分支（SPEC §13.3.7，自动识别）: /etc/init.d/vpsmon stop+disable →
 #           撤销 uci 防火墙规则（标记 /etc/vpsmon/.firewall-rule）→ 删 init 脚本与
 #           /opt/vpsmon → 交互确认或 --keep-data 决定是否删除 /etc/vpsmon 数据目录
-#           （不卸载 python3/curl/ca-bundle 等 opkg 包，可能被其他包依赖）
+#           （不卸载 python3/curl/ca-bundle 等 opkg/apk 包，可能被其他包依赖）
 # =============================================================================
 set -euo pipefail
 
@@ -81,7 +81,7 @@ require_root() {
   fi
 }
 
-# ---------- OpenWrt 平台判定（SPEC §13.3.1: /etc/openwrt_release 或 opkg 或 os-release） ----------
+# ---------- OpenWrt 平台判定（SPEC §13.3.1: /etc/openwrt_release 或 opkg/apk 或 os-release；含 ImmortalWrt） ----------
 is_openwrt() {
   if [ -f /etc/openwrt_release ] || command -v opkg >/dev/null 2>&1; then
     return 0
@@ -91,6 +91,7 @@ is_openwrt() {
     . /etc/os-release
     case "$ID:$ID_LIKE" in
       *openwrt*) return 0 ;;
+      *immortalwrt*) return 0 ;;
     esac
   fi
   return 1
@@ -131,7 +132,7 @@ openwrt_firewall_revoke() {
   info "已删除 uci 防火墙标记 $OPENWRT_FIREWALL_MARKER"
 }
 
-# ---------- OpenWrt 卸载主流程（SPEC §13.3.7: 无 systemd，走 procd/uci；不卸载 opkg 包） ----------
+# ---------- OpenWrt 卸载主流程（SPEC §13.3.7: 无 systemd，走 procd/uci；不卸载 opkg/apk 包） ----------
 openwrt_do_uninstall() {
   # 1. 停止并禁用服务（若存在）
   if [ -f "$OPENWRT_INIT_FILE" ]; then
@@ -173,9 +174,9 @@ openwrt_do_uninstall() {
       warn "检测到非交互执行（stdin 非终端），跳过删除确认，默认保留数据目录 $OPENWRT_DATA_DIR"
     fi
   fi
-  # 6. 不卸载 python3/curl/ca-bundle 等 opkg 包（可能被其他包依赖，超出本应用职责）
+  # 6. 不卸载 python3/curl/ca-bundle 等 opkg/apk 包（可能被其他包依赖，超出本应用职责）
   echo
-  info "卸载完成。（未卸载 python3/curl/ca-bundle 等 opkg 包——它们可能被其他包依赖）"
+  info "卸载完成。（未卸载 python3/curl/ca-bundle 等 opkg/apk 包——它们可能被其他包依赖）"
 }
 
 # ---------- 撤销安装时自动添加的防火墙规则（SECURITY.md §4.10-C/S3） ----------
